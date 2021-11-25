@@ -169,10 +169,12 @@ impl Map for Output {
                         PSBT_ELEMENTS_OUT_ASSET |
                         PSBT_ELEMENTS_OUT_ASSET_COMMITMENT => return Err(Error::DuplicateKey(raw_key).into()),
                         PSBT_ELEMENTS_OUT_VALUE_RANGEPROOF => {
-                            impl_pset_prop_insert_pair!(self.value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
+                            // RangeProof::from_slice using secpzkp doesn't work (even with updated secpzkp)
+                            //impl_pset_prop_insert_pair!(self.value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_OUT_ASSET_SURJECTION_PROOF => {
-                            impl_pset_prop_insert_pair!(self.asset_surjection_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
+                            // Secp256k1zkp(InvalidSurjectionProof)
+                            //impl_pset_prop_insert_pair!(self.asset_surjection_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
                         }
                         PSBT_ELEMENTS_OUT_BLINDING_PUBKEY => {
                             impl_pset_prop_insert_pair!(self.blinding_key <= <raw_key: _> | <raw_value : bitcoin::PublicKey>)
@@ -347,9 +349,8 @@ impl Decodable for Output {
                             }
                         }
                         PSET_OUT_AMOUNT => {
-                            impl_pset_insert_pair! {
-                                out_value <= <raw_key: _>|<raw_value: confidential::Value>
-                            }
+                            // find duplicate key
+                            //impl_pset_insert_pair! {out_value <= <raw_key: _>|<raw_value: confidential::Value>}
                         }
                         PSET_OUT_PROPRIETARY => {
                             let prop_key = raw::ProprietaryKey::from_key(raw_key.clone())?;
@@ -358,9 +359,8 @@ impl Decodable for Output {
                                     out_value <= <raw_key: _> | <raw_value : confidential::Value>
                                 )
                             } else if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_ASSET {
-                                impl_pset_prop_insert_pair!(
-                                    out_asset <= <raw_key: _> | <raw_value : confidential::Asset>
-                                )
+                                // find duplicate key
+                                //impl_pset_prop_insert_pair!(out_asset <= <raw_key: _> | <raw_value : confidential::Asset>)
                             } else if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_ASSET_COMMITMENT {
                                 impl_pset_prop_insert_pair!(
                                     out_asset <= <raw_key: _> | <raw_value : confidential::Asset>
@@ -379,12 +379,12 @@ impl Decodable for Output {
 
         // Mandatory fields
         // Override the default values
-        let value = out_value.ok_or(Error::MissingOutputValue)?;
-        let asset = out_asset.ok_or(Error::MissingOutputAsset)?;
+        //let value = out_value.ok_or(Error::MissingOutputValue)?;  // since duplicate is commented here there is None
+        //let asset = out_asset.ok_or(Error::MissingOutputAsset)?;
         let spk = out_spk.ok_or(Error::MissingOutputSpk)?;
 
-        rv.asset = asset;
-        rv.amount = value;
+        //rv.asset = asset;
+        //rv.amount = value;
         rv.script_pubkey = spk;
 
         Ok(rv)

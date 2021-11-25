@@ -399,7 +399,8 @@ impl Map for Input {
                             impl_pset_prop_insert_pair!(self.issuance_asset_entropy <= <raw_key: _> | <raw_value : [u8;32]>)
                         }
                         PSBT_ELEMENTS_IN_UTXO_RANGEPROOF => {
-                            impl_pset_prop_insert_pair!(self.in_utxo_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
+                            // RangeProof::from_slice using secpzkp doesn't work (even with updated secpzkp)
+                            //impl_pset_prop_insert_pair!(self.in_utxo_rangeproof <= <raw_key: _> | <raw_value : RangeProof>);
                         }
                         _ => match self.proprietary.entry(prop_key) {
                                 Entry::Vacant(empty_key) => {
