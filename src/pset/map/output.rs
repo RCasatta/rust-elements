@@ -26,6 +26,8 @@ use pset::Error;
 use secp256k1_zkp::{RangeProof, SurjectionProof};
 
 use {TxOut};
+use AssetId;
+use confidential::{Asset, Value};
 
 /// Type: Redeem Script PSET_OUT_REDEEM_SCRIPT = 0x00
 const PSET_OUT_REDEEM_SCRIPT: u8 = 0x00;
@@ -61,6 +63,16 @@ const PSBT_ELEMENTS_OUT_ECDH_PUBKEY: u8 = 0x07;
 /// The unsigned 32-bit little endian integer index of the input
 /// whose owner should blind this output.
 const PSBT_ELEMENTS_OUT_BLINDER_INDEX: u8 = 0x08;
+/// An explicit value rangeproof that proves that the value commitment in
+/// PSBT_ELEMENTS_OUT_VALUE_COMMITMENT matches the explicit value in PSBT_OUT_VALUE. If provided,
+/// PSBT_ELEMENTS_OUT_VALUE_COMMITMENT must be provided too.
+const PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF: u8 = 0x09;
+/// An asset surjection proof with this output's asset as the only asset in the input set in order
+/// to prove that the asset commitment in PSBT_ELEMENTS_OUT_ASSET_COMMITMENT matches the explicit
+/// asset in PSBT_ELEMENTS_OUT_ASSET. If provided, PSBT_ELEMENTS_OUT_ASSET_COMMITMENT must be
+/// provided too.
+const PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF: u8 = 0x0a;
+
 
 /// A key-value map for an output of the corresponding index in the unsigned
 /// transaction.
@@ -77,10 +89,14 @@ pub struct Output {
     pub bip32_derivation: BTreeMap<PublicKey, KeySource>,
     /// (PSET2) The amount of the output
     pub amount: confidential::Value,
+    /// (PSET2) The proof the confidential amount is this explicit value
+    pub amount_proof: Option<(u64, Vec<u8>)>,
     /// (PSET2) The script pubkey of the output
     pub script_pubkey: Script,
     /// The output asset (mandatory for each output)
     pub asset: confidential::Asset,
+    /// (PSET2) The proof the confidential asset is this AssetId
+    pub asset_proof: Option<(AssetId, Vec<u8>)>,
     // Proprietary key-value pairs for this output.
     /// Output value rangeproof
     pub value_rangeproof: Option<RangeProof>,
@@ -331,10 +347,15 @@ impl Decodable for Output {
 
         // Sets the default to [0;32] and [0;4]
         let mut rv = Self::default();
+
         let mut out_value: Option<confidential::Value> = None;
-        let mut out_asset: Option<confidential::Asset> = None;
         let mut out_value_commitment: Option<confidential::Value> = None;
+        let mut out_value_proof: Option<Vec<u8>> = None;
+
+        let mut out_asset: Option<confidential::Asset> = None;
         let mut out_asset_commitment: Option<confidential::Asset> = None;
+        let mut out_asset_proof: Option<Vec<u8>> = None;
+
         let mut out_spk: Option<Script> = None;
 
         loop {
@@ -365,6 +386,14 @@ impl Decodable for Output {
                                 impl_pset_prop_insert_pair!(
                                     out_asset_commitment <= <raw_key: _> | <raw_value : confidential::Asset>
                                 )
+                            } else if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF {
+                                impl_pset_prop_insert_pair!(
+                                    out_asset_proof <= <raw_key: _> | <raw_value : Vec<u8>>
+                                )
+                            } else if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF {
+                                impl_pset_prop_insert_pair!(
+                                    out_value_proof <= <raw_key: _> | <raw_value : Vec<u8>>
+                                )
                             } else {
                                 rv.insert_pair(raw::Pair { key: raw_key, value: raw_value })?;
                             }
@@ -379,12 +408,27 @@ impl Decodable for Output {
 
         // Mandatory fields
         // Override the default values
-        let value = out_value_commitment.or(out_value).ok_or(Error::MissingOutputValue)?;  // since duplicate is commented here there is None
-        let asset = out_asset_commitment.or(out_asset).ok_or(Error::MissingOutputAsset)?;
-        let spk = out_spk.ok_or(Error::MissingOutputSpk)?;
+        match (out_value, out_value_commitment, out_value_proof) {
+            (Some(Value::Explicit(value)), None, None) => rv.amount = Value::Explicit(value),
+            (None, Some(Value::Confidential(commitment)), None) => rv.amount = Value::Confidential(commitment),
+            (Some(Value::Explicit(value)), Some(Value::Confidential(commitment)), Some(proof)) => {
+                rv.amount = Value::Confidential(commitment);
+                rv.amount_proof = Some((value, proof));
+            },
+            _ => return Err(Error::MissingOutputValue.into()),
+        }
 
-        rv.asset = asset;
-        rv.amount = value;
+        match (out_asset, out_asset_commitment, out_asset_proof) {
+            (Some(Asset::Explicit(value)), None, None) => rv.asset = Asset::Explicit(value),
+            (None, Some(Asset::Confidential(generator)), None) => rv.asset = Asset::Confidential(generator),
+            (Some(Asset::Explicit(value)), Some(Asset::Confidential(generator)), Some(proof)) => {
+                rv.asset = Asset::Confidential(generator);
+                rv.asset_proof = Some((value, proof));
+            },
+            _ => return Err(Error::MissingOutputAsset.into()),
+        }
+
+        let spk = out_spk.ok_or(Error::MissingOutputSpk)?;
         rv.script_pubkey = spk;
 
         Ok(rv)
