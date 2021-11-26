@@ -795,4 +795,11 @@ mod tests {
         // pset.add_output(Output::from_txout(txout));
         // println!("{}", encode::serialize_hex(&pset));
     }
+
+    #[test]
+    fn pset_from_elements() {
+        let pset_str = include_str!("../../pset_swap_tutorial.hex");
+        let bytes = Vec::<u8>::from_hex(pset_str).unwrap();
+        let _pset = encode::deserialize::<PartiallySignedTransaction>(&bytes).unwrap();
+    }
 }
