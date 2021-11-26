@@ -333,6 +333,8 @@ impl Decodable for Output {
         let mut rv = Self::default();
         let mut out_value: Option<confidential::Value> = None;
         let mut out_asset: Option<confidential::Asset> = None;
+        let mut out_value_commitment: Option<confidential::Value> = None;
+        let mut out_asset_commitment: Option<confidential::Asset> = None;
         let mut out_spk: Option<Script> = None;
 
         loop {
@@ -349,21 +351,19 @@ impl Decodable for Output {
                             }
                         }
                         PSET_OUT_AMOUNT => {
-                            // find duplicate key
-                            //impl_pset_insert_pair! {out_value <= <raw_key: _>|<raw_value: confidential::Value>}
+                            impl_pset_insert_pair! {out_value <= <raw_key: _>|<raw_value: confidential::Value>}
                         }
                         PSET_OUT_PROPRIETARY => {
                             let prop_key = raw::ProprietaryKey::from_key(raw_key.clone())?;
                             if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_VALUE_COMMITMENT {
                                 impl_pset_prop_insert_pair!(
-                                    out_value <= <raw_key: _> | <raw_value : confidential::Value>
+                                    out_value_commitment <= <raw_key: _> | <raw_value : confidential::Value>
                                 )
                             } else if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_ASSET {
-                                // find duplicate key
-                                //impl_pset_prop_insert_pair!(out_asset <= <raw_key: _> | <raw_value : confidential::Asset>)
+                                impl_pset_prop_insert_pair!(out_asset <= <raw_key: _> | <raw_value : confidential::Asset>)
                             } else if prop_key.is_pset_key() && prop_key.subtype == PSBT_ELEMENTS_OUT_ASSET_COMMITMENT {
                                 impl_pset_prop_insert_pair!(
-                                    out_asset <= <raw_key: _> | <raw_value : confidential::Asset>
+                                    out_asset_commitment <= <raw_key: _> | <raw_value : confidential::Asset>
                                 )
                             } else {
                                 rv.insert_pair(raw::Pair { key: raw_key, value: raw_value })?;
@@ -379,12 +379,12 @@ impl Decodable for Output {
 
         // Mandatory fields
         // Override the default values
-        //let value = out_value.ok_or(Error::MissingOutputValue)?;  // since duplicate is commented here there is None
-        //let asset = out_asset.ok_or(Error::MissingOutputAsset)?;
+        let value = out_value_commitment.or(out_value).ok_or(Error::MissingOutputValue)?;  // since duplicate is commented here there is None
+        let asset = out_asset_commitment.or(out_asset).ok_or(Error::MissingOutputAsset)?;
         let spk = out_spk.ok_or(Error::MissingOutputSpk)?;
 
-        //rv.asset = asset;
-        //rv.amount = value;
+        rv.asset = asset;
+        rv.amount = value;
         rv.script_pubkey = spk;
 
         Ok(rv)
