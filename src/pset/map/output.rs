@@ -21,7 +21,7 @@ use bitcoin::{self, PublicKey};
 use {pset, confidential};
 use encode::Decodable;
 use pset::map::Map;
-use pset::raw;
+use pset::{add_prefix_if_missing, raw};
 use pset::Error;
 use secp256k1_zkp::{self, Generator, RangeProof, SurjectionProof};
 
@@ -286,9 +286,11 @@ impl Map for Output {
                             impl_pset_prop_insert_pair!(self.asset_comm <= <raw_key: _> | <raw_value : Generator>)
                         }
                         PSBT_ELEMENTS_OUT_VALUE_RANGEPROOF => {
+                            let raw_value = add_prefix_if_missing(&raw_value);
                             impl_pset_prop_insert_pair!(self.value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_OUT_ASSET_SURJECTION_PROOF => {
+                            let raw_value = add_prefix_if_missing(&raw_value);
                             impl_pset_prop_insert_pair!(self.asset_surjection_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
                         }
                         PSBT_ELEMENTS_OUT_BLINDING_PUBKEY => {
@@ -301,9 +303,11 @@ impl Map for Output {
                             impl_pset_prop_insert_pair!(self.blinder_index <= <raw_key: _> | <raw_value : u32>)
                         }
                         PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF => {
+                            let raw_value = add_prefix_if_missing(&raw_value);
                             impl_pset_prop_insert_pair!(self.blind_value_proof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF => {
+                            let raw_value = add_prefix_if_missing(&raw_value);
                             impl_pset_prop_insert_pair!(self.blind_asset_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
                         }
                         _ => {

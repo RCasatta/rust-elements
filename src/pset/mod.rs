@@ -31,7 +31,7 @@ pub mod serialize;
 
 use {Transaction, Txid, TxIn, OutPoint, TxInWitness, TxOut, TxOutWitness};
 use encode::{self, Encodable, Decodable};
-use confidential;
+use ::{confidential, VarInt};
 use secp256k1_zkp::rand::{CryptoRng, RngCore};
 use secp256k1_zkp::{self, RangeProof, SurjectionProof};
 use {TxOutSecrets, blind::RangeProofMessage, confidential::{AssetBlindingFactor, ValueBlindingFactor}};
@@ -40,6 +40,7 @@ use bitcoin;
 use blind::ConfidentialTxOutError;
 
 use blind::{BlindAssetProofs, BlindValueProofs};
+use pset::serialize::Serialize;
 
 pub use self::error::{Error, PsetBlindError};
 pub use self::map::{Global, GlobalTxData, Input, Output};
@@ -633,6 +634,23 @@ impl Decodable for PartiallySignedTransaction {
         pset.sanity_check()?;
         Ok(pset)
     }
+}
+
+/// return the given vec prepended with the varint of the length of the given vec if it's not already there
+pub fn add_prefix_if_missing(vec: &[u8]) -> Vec<u8> {
+    let v = VarInt::consensus_decode(&vec[..]).unwrap();
+    if v.0 as usize == vec[v.len()..].len() {
+        // it's prepended with the length do nothing
+        vec.to_vec()
+    } else {
+        let varint = VarInt(vec.len() as u64);
+        let varint_len = varint.len();
+        let mut with_prefix = Vec::with_capacity(vec.len() + varint_len);
+        with_prefix.extend(&varint.serialize());
+        with_prefix.extend(vec);
+        with_prefix
+    }
+
 }
 
 #[cfg(test)]
