@@ -642,27 +642,20 @@ impl Decodable for PartiallySignedTransaction {
     }
 }
 
-/// return the given vec prepended with the varint of the length of the given vec if it's not already there
-pub fn add_prefix_if_missing(vec: &[u8]) -> Vec<u8> {
-    let v = VarInt::consensus_decode(&vec[..]).unwrap();
-    if v.0 as usize == vec[v.len()..].len() {
-        // it's prepended with the length do nothing
-        vec.to_vec()
-    } else {
-        let varint = VarInt(vec.len() as u64);
-        let varint_len = varint.len();
-        let mut with_prefix = Vec::with_capacity(vec.len() + varint_len);
-        with_prefix.extend(&varint.serialize());
-        with_prefix.extend(vec);
-        with_prefix
-    }
-
+/// return the given vec prepended with the varint of the length of the given vec
+pub fn add_prefix(vec: &[u8]) -> Vec<u8> {
+    let varint = VarInt(vec.len() as u64);
+    let varint_len = varint.len();
+    let mut with_prefix = Vec::with_capacity(vec.len() + varint_len);
+    with_prefix.extend(&varint.serialize());
+    with_prefix.extend(vec);
+    with_prefix
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::hex::FromHex;
+    use bitcoin::hashes::hex::{FromHex, ToHex};
 
     fn tx_pset_rtt(tx_hex: &str) {
         let tx: Transaction = encode::deserialize(&Vec::<u8>::from_hex(tx_hex).unwrap()[..]).unwrap();
@@ -824,6 +817,10 @@ mod tests {
     fn pset_from_elements() {
         let pset_str = include_str!("../../pset_swap_tutorial.hex");
         let bytes = Vec::<u8>::from_hex(pset_str).unwrap();
-        let _pset = encode::deserialize::<PartiallySignedTransaction>(&bytes).unwrap();
+        let pset = encode::deserialize::<PartiallySignedTransaction>(&bytes).unwrap();
+
+        assert_eq!(pset_str.len(), encode::serialize(&pset).to_hex().len());
+        assert_eq!(pset_str, encode::serialize(&pset).to_hex());
+
     }
 }

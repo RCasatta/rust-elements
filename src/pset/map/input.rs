@@ -21,7 +21,7 @@ use bitcoin::util::bip32::KeySource;
 use bitcoin::{self, PublicKey};
 use hashes::{self, hash160, ripemd160, sha256, sha256d};
 use pset::map::Map;
-use pset::{add_prefix_if_missing, raw};
+use pset::{add_prefix, raw};
 use pset::serialize;
 use pset::{self, Error, error};
 use secp256k1_zkp::{self, RangeProof, Tweak, ZERO_TWEAK};
@@ -397,11 +397,11 @@ impl Map for Input {
                             impl_pset_prop_insert_pair!(self.issuance_value_comm <= <raw_key: _> | <raw_value : secp256k1_zkp::PedersenCommitment>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_VALUE_RANGEPROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.issuance_value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_KEYS_RANGEPROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.issuance_keys_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_IN_PEG_IN_TX => {
@@ -436,15 +436,15 @@ impl Map for Input {
                             impl_pset_prop_insert_pair!(self.issuance_asset_entropy <= <raw_key: _> | <raw_value : [u8;32]>)
                         }
                         PSBT_ELEMENTS_IN_UTXO_RANGEPROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.in_utxo_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_BLIND_VALUE_PROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.in_issuance_blind_value_proof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_BLIND_INFLATION_KEYS_PROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.in_issuance_blind_inflation_keys_proof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         _ => match self.proprietary.entry(prop_key) {
@@ -557,11 +557,11 @@ impl Map for Input {
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.issuance_value_rangeproof as <PSBT_ELEMENTS_IN_ISSUANCE_VALUE_RANGEPROOF, _>)
+            rv.push_prop_var(self.issuance_value_rangeproof as <PSBT_ELEMENTS_IN_ISSUANCE_VALUE_RANGEPROOF, _>)
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.issuance_keys_rangeproof as <PSBT_ELEMENTS_IN_ISSUANCE_KEYS_RANGEPROOF, _>)
+            rv.push_prop_var(self.issuance_keys_rangeproof as <PSBT_ELEMENTS_IN_ISSUANCE_KEYS_RANGEPROOF, _>)
         }
 
         impl_pset_get_pair! {
@@ -605,15 +605,15 @@ impl Map for Input {
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.in_utxo_rangeproof as <PSBT_ELEMENTS_IN_UTXO_RANGEPROOF, _>)
+            rv.push_prop_var(self.in_utxo_rangeproof as <PSBT_ELEMENTS_IN_UTXO_RANGEPROOF, _>)
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.in_issuance_blind_value_proof as <PSBT_ELEMENTS_IN_ISSUANCE_BLIND_VALUE_PROOF, _>)
+            rv.push_prop_var(self.in_issuance_blind_value_proof as <PSBT_ELEMENTS_IN_ISSUANCE_BLIND_VALUE_PROOF, _>)
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.in_issuance_blind_inflation_keys_proof as <PSBT_ELEMENTS_IN_ISSUANCE_BLIND_INFLATION_KEYS_PROOF, _>)
+            rv.push_prop_var(self.in_issuance_blind_inflation_keys_proof as <PSBT_ELEMENTS_IN_ISSUANCE_BLIND_INFLATION_KEYS_PROOF, _>)
         }
 
         for (key, value) in self.proprietary.iter() {

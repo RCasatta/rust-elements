@@ -21,7 +21,7 @@ use bitcoin::{self, PublicKey};
 use {pset, confidential};
 use encode::Decodable;
 use pset::map::Map;
-use pset::{add_prefix_if_missing, raw};
+use pset::{add_prefix, raw};
 use pset::Error;
 use secp256k1_zkp::{self, Generator, RangeProof, SurjectionProof};
 
@@ -285,11 +285,11 @@ impl Map for Output {
                             impl_pset_prop_insert_pair!(self.asset_comm <= <raw_key: _> | <raw_value : Generator>)
                         }
                         PSBT_ELEMENTS_OUT_VALUE_RANGEPROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_OUT_ASSET_SURJECTION_PROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.asset_surjection_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
                         }
                         PSBT_ELEMENTS_OUT_BLINDING_PUBKEY => {
@@ -302,11 +302,11 @@ impl Map for Output {
                             impl_pset_prop_insert_pair!(self.blinder_index <= <raw_key: _> | <raw_value : u32>)
                         }
                         PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.blind_value_proof <= <raw_key: _> | <raw_value : RangeProof>)
                         }
                         PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF => {
-                            let raw_value = add_prefix_if_missing(&raw_value);
+                            let raw_value = add_prefix(&raw_value);
                             impl_pset_prop_insert_pair!(self.blind_asset_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
                         }
                         _ => {
@@ -372,11 +372,11 @@ impl Map for Output {
 
         // Prop Output fields
         impl_pset_get_pair! {
-            rv.push_prop(self.value_rangeproof as <PSBT_ELEMENTS_OUT_VALUE_RANGEPROOF, _>)
+            rv.push_prop_var(self.value_rangeproof as <PSBT_ELEMENTS_OUT_VALUE_RANGEPROOF, _>)
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.asset_surjection_proof as <PSBT_ELEMENTS_OUT_ASSET_SURJECTION_PROOF, _>)
+            rv.push_prop_var(self.asset_surjection_proof as <PSBT_ELEMENTS_OUT_ASSET_SURJECTION_PROOF, _>)
         }
 
         impl_pset_get_pair! {
@@ -392,11 +392,11 @@ impl Map for Output {
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.blind_value_proof as <PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF, _>)
+            rv.push_prop_var(self.blind_value_proof as <PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF, _>)
         }
 
         impl_pset_get_pair! {
-            rv.push_prop(self.blind_asset_proof as <PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF, _>)
+            rv.push_prop_var(self.blind_asset_proof as <PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF, _>)
         }
 
         for (key, value) in self.proprietary.iter() {

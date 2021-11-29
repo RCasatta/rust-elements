@@ -177,6 +177,15 @@ macro_rules! impl_pset_get_pair {
             });
         }
     };
+    ($rv:ident.push_prop_var($slf:ident.$unkeyed_name:ident as <$unkeyed_typeval:expr, _>)) => {
+        if let Some(ref $unkeyed_name) = $slf.$unkeyed_name {
+            let key = $crate::pset::raw::ProprietaryKey::from_pset_pair($unkeyed_typeval, vec![]);
+            $rv.push($crate::pset::raw::Pair {
+                key: key.to_key(),
+                value: $unkeyed_name.serialize(),
+            });
+        }
+    };
     ($rv:ident.push_mandatory($unkeyed_name:ident as <$unkeyed_typeval:expr, _>)) => {
             $rv.push($crate::pset::raw::Pair {
                 key: $crate::pset::raw::Key {
