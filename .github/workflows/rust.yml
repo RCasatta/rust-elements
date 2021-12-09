@@ -20,9 +20,9 @@ jobs:
           - rust: nightly
             env:
               DUMMY: true
-          - rust: 1.29.0
+          - rust: 1.36.0
             env:
-              PIN_VERSIONS: true
+              DUMMY: true
     steps:
       - name: Install test dependencies
         run: sudo apt-get install -y binutils-dev libunwind8-dev
