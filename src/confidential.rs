@@ -17,10 +17,11 @@
 //! Structures representing Pedersen commitments of various types
 //!
 
-use hashes::{sha256d, Hash, hex};
+use crate::hashes::{sha256d, Hash};
+use crate::hex;
 use secp256k1_zkp::{self, CommitmentSecrets, Generator, PedersenCommitment,
     PublicKey, Secp256k1, SecretKey, Signing, Tweak, ZERO_TWEAK,
-    compute_adaptive_blinding_factor, ecdh::SharedSecret,
+    compute_adaptive_blinding_factor,
     rand::{CryptoRng, Rng, RngCore}
 };
 #[cfg(feature = "serde")]
@@ -28,11 +29,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use std::{fmt, io, ops::{AddAssign, Neg}, str};
 
-use encode::{self, Decodable, Encodable};
-use issuance::AssetId;
+use crate::encode::{self, Decodable, Encodable};
+use crate::issuance::AssetId;
 
 /// A CT commitment to an amount
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum Value {
     /// No value
     Null,
@@ -84,30 +85,21 @@ impl Value {
 
     /// Check if the object is null.
     pub fn is_null(&self) -> bool {
-        match self {
-            Value::Null => true,
-            _ => false
-        }
+        matches!(*self, Value::Null)
     }
 
     /// Check if the object is explicit.
     pub fn is_explicit(&self) -> bool {
-        match self {
-            Value::Explicit(_) => true,
-            _ => false
-        }
+        matches!(*self, Value::Explicit(_))
     }
 
     /// Check if the object is confidential.
     pub fn is_confidential(&self) -> bool {
-        match self {
-            Value::Confidential(_) => true,
-            _ => false
-        }
+        matches!(*self, Value::Confidential(_))
     }
 
     /// Returns the explicit inner value.
-    /// Returns [None] if [is_explicit] returns false.
+    /// Returns [None] if [Value::is_explicit] returns false.
     pub fn explicit(&self) -> Option<u64> {
         match *self {
             Value::Explicit(i) => Some(i),
@@ -116,7 +108,7 @@ impl Value {
     }
 
     /// Returns the confidential commitment in case of a confidential value.
-    /// Returns [None] if [is_confidential] returns false.
+    /// Returns [None] if [Value::is_confidential] returns false.
     pub fn commitment(&self) -> Option<PedersenCommitment> {
         match *self {
             Value::Confidential(i) => Some(i),
@@ -168,32 +160,20 @@ impl Encodable for PedersenCommitment {
 }
 
 impl Decodable for Value {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Value, encode::Error> {
-        let prefix = {
-            let buffer = d.fill_buf()?;
-
-            if buffer.is_empty() {
-                return Err(encode::Error::UnexpectedEOF);
-            }
-
-            buffer[0]
-        };
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Value, encode::Error> {
+        let prefix = u8::consensus_decode(&mut d)?;
 
         match prefix {
-            0 => {
-                // consume null value prefix
-                d.consume(1);
-                Ok(Value::Null)
-            }
+            0 => Ok(Value::Null),
             1 => {
-                // ignore prefix when decoding an explicit value
-                d.consume(1);
                 let explicit = u64::swap_bytes(Decodable::consensus_decode(&mut d)?);
                 Ok(Value::Explicit(explicit))
             }
             p if p == 0x08 || p == 0x09 => {
-                let commitment = Decodable::consensus_decode(&mut d)?;
-                Ok(Value::Confidential(commitment))
+                let mut comm = [0u8; 33];
+                comm[0] = p;
+                d.read_exact(&mut comm[1..])?;
+                Ok(Value::Confidential(PedersenCommitment::from_slice(&comm)?))
             }
             p => Err(encode::Error::InvalidConfidentialPrefix(p)),
         }
@@ -201,7 +181,7 @@ impl Decodable for Value {
 }
 
 impl Decodable for PedersenCommitment {
-    fn consensus_decode<D: io::BufRead>(d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<D: io::Read>(d: D) -> Result<Self, encode::Error> {
         let bytes = <[u8; 33]>::consensus_decode(d)?;
         Ok(PedersenCommitment::from_slice(&bytes)?)
     }
@@ -272,7 +252,7 @@ impl<'de> Deserialize<'de> for Value {
 }
 
 /// A CT commitment to an asset
-#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub enum Asset {
     /// No value
     Null,
@@ -312,30 +292,21 @@ impl Asset {
 
     /// Check if the object is null.
     pub fn is_null(&self) -> bool {
-        match *self {
-            Asset::Null => true,
-            _ => false
-        }
+        matches!(*self, Asset::Null)
     }
 
     /// Check if the object is explicit.
     pub fn is_explicit(&self) -> bool {
-        match *self {
-            Asset::Explicit(_) => true,
-            _ => false
-        }
+        matches!(*self, Asset::Explicit(_))
     }
 
     /// Check if the object is confidential.
     pub fn is_confidential(&self) -> bool {
-        match *self {
-            Asset::Confidential(_) => true,
-            _ => false
-        }
+        matches!(*self, Asset::Confidential(_))
     }
 
     /// Returns the explicit inner value.
-    /// Returns [None] if [is_explicit] returns false.
+    /// Returns [None] if [Asset::is_explicit] returns false.
     pub fn explicit(&self) -> Option<AssetId> {
         match *self {
             Asset::Explicit(i) => Some(i),
@@ -344,7 +315,7 @@ impl Asset {
     }
 
     /// Returns the confidential commitment in case of a confidential value.
-    /// Returns [None] if [is_confidential] returns false.
+    /// Returns [None] if [Asset::is_confidential] returns false.
     pub fn commitment(&self) -> Option<Generator> {
         match *self {
             Asset::Confidential(i) => Some(i),
@@ -364,7 +335,7 @@ impl Asset {
         match self {
             // Only error is Null error which is dealt with later
             // when we have more context information about it.
-            Asset::Null => return None,
+            Asset::Null => None,
             Asset::Explicit(x) => {
                 Some(Generator::new_unblinded(secp, x.into_tag()))
             }
@@ -395,6 +366,7 @@ impl Default for Asset {
     }
 }
 
+
 impl Encodable for Asset {
     fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, encode::Error> {
         match *self {
@@ -416,32 +388,20 @@ impl Encodable for Generator {
 }
 
 impl Decodable for Asset {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Self, encode::Error> {
-        let prefix = {
-            let buffer = d.fill_buf()?;
-
-            if buffer.is_empty() {
-                return Err(encode::Error::UnexpectedEOF);
-            }
-
-            buffer[0]
-        };
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
+        let prefix = u8::consensus_decode(&mut d)?;
 
         match prefix {
-            0 => {
-                // consume null value prefix
-                d.consume(1);
-                Ok(Asset::Null)
-            }
+            0 => Ok(Asset::Null),
             1 => {
-                // ignore prefix when decoding an explicit asset
-                d.consume(1);
                 let explicit = Decodable::consensus_decode(&mut d)?;
                 Ok(Asset::Explicit(explicit))
             }
             p if p == 0x0a || p == 0x0b => {
-                let generator = Decodable::consensus_decode(&mut d)?;
-                Ok(Asset::Confidential(generator))
+                let mut comm = [0u8; 33];
+                comm[0] = p;
+                d.read_exact(&mut comm[1..])?;
+                Ok(Asset::Confidential(Generator::from_slice(&comm[..])?))
             }
             p => Err(encode::Error::InvalidConfidentialPrefix(p)),
         }
@@ -449,7 +409,7 @@ impl Decodable for Asset {
 }
 
 impl Decodable for Generator {
-    fn consensus_decode<D: io::BufRead>(d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<D: io::Read>(d: D) -> Result<Self, encode::Error> {
         let bytes = <[u8; 33]>::consensus_decode(d)?;
         Ok(Generator::from_slice(&bytes)?)
     }
@@ -540,11 +500,19 @@ impl Nonce {
         secp: &Secp256k1<C>,
         receiver_blinding_pk: &PublicKey,
     ) -> (Self, SecretKey) {
-        let sender_sk = SecretKey::new(rng);
-        let sender_pk = PublicKey::from_secret_key(&secp, &sender_sk);
+        let ephemeral_sk = SecretKey::new(rng);
+        Self::with_ephemeral_sk(secp, ephemeral_sk, receiver_blinding_pk)
+    }
 
-        let shared_secret = Self::make_shared_secret(receiver_blinding_pk, &sender_sk);
-
+    /// Similar to [Nonce::new_confidential], but with a given `ephemeral_sk`
+    /// instead of sampling it from rng.
+    pub fn with_ephemeral_sk<C: Signing>(
+        secp: &Secp256k1<C>,
+        ephemeral_sk: SecretKey,
+        receiver_blinding_pk: &PublicKey
+    ) -> (Self, SecretKey) {
+        let sender_pk = PublicKey::from_secret_key(secp, &ephemeral_sk);
+        let shared_secret = Self::make_shared_secret(receiver_blinding_pk, &ephemeral_sk);
         (Nonce::Confidential(sender_pk), shared_secret)
     }
 
@@ -552,7 +520,7 @@ impl Nonce {
     pub fn shared_secret(&self, receiver_blinding_sk: &SecretKey) -> Option<SecretKey> {
         match self {
             Nonce::Confidential(sender_pk) => {
-                Some(Self::make_shared_secret(&sender_pk, receiver_blinding_sk))
+                Some(Self::make_shared_secret(sender_pk, receiver_blinding_sk))
             }
             _ => None,
         }
@@ -560,22 +528,23 @@ impl Nonce {
 
     /// Create the shared secret.
     fn make_shared_secret(pk: &PublicKey, sk: &SecretKey) -> SecretKey {
-        let shared_secret = SharedSecret::new_with_hash(pk, sk, |x, y| {
+        let xy = secp256k1_zkp::ecdh::shared_secret_point(pk, sk);
+        let shared_secret = {
             // Yes, what follows is the compressed representation of a Bitcoin public key.
             // However, this is more by accident then by design, see here: https://github.com/rust-bitcoin/rust-secp256k1/pull/255#issuecomment-744146282
 
             let mut dh_secret = [0u8; 33];
-            dh_secret[0] = if y.last().unwrap() % 2 == 0 {
+            dh_secret[0] = if xy.last().unwrap() % 2 == 0 {
                 0x02
             } else {
                 0x03
             };
-            dh_secret[1..].copy_from_slice(&x);
+            dh_secret[1..].copy_from_slice(&xy[0..32]);
 
-            sha256d::Hash::hash(&dh_secret).into_inner().into()
-        });
+            sha256d::Hash::hash(&dh_secret).to_byte_array()
+        };
 
-        SecretKey::from_slice(&shared_secret.as_ref()[..32]).expect("always has exactly 32 bytes")
+        SecretKey::from_slice(&shared_secret[..32]).expect("always has exactly 32 bytes")
     }
 
     /// Serialized length, in bytes
@@ -596,30 +565,21 @@ impl Nonce {
 
     /// Check if the object is null.
     pub fn is_null(&self) -> bool {
-        match *self {
-            Nonce::Null => true,
-            _ => false
-        }
+        matches!(*self, Nonce::Null)
     }
 
     /// Check if the object is explicit.
     pub fn is_explicit(&self) -> bool {
-        match *self {
-            Nonce::Explicit(_) => true,
-            _ => false
-        }
+        matches!(*self, Nonce::Explicit(_))
     }
 
     /// Check if the object is confidential.
     pub fn is_confidential(&self) -> bool {
-        match *self {
-            Nonce::Confidential(_) => true,
-            _ => false
-        }
+        matches!(*self, Nonce::Confidential(_))
     }
 
     /// Returns the explicit inner value.
-    /// Returns [None] if [is_explicit] returns false.
+    /// Returns [None] if [Nonce::is_explicit] returns false.
     pub fn explicit(&self) -> Option<[u8; 32]> {
         match *self {
             Nonce::Explicit(i) => Some(i),
@@ -628,7 +588,7 @@ impl Nonce {
     }
 
     /// Returns the confidential commitment in case of a confidential value.
-    /// Returns [None] if [is_confidential] returns false.
+    /// Returns [None] if [Nonce::is_confidential] returns false.
     pub fn commitment(&self) -> Option<PublicKey> {
         match *self {
             Nonce::Confidential(i) => Some(i),
@@ -685,32 +645,20 @@ impl Encodable for PublicKey {
 }
 
 impl Decodable for Nonce {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Self, encode::Error> {
-        let prefix = {
-            let buffer = d.fill_buf()?;
-
-            if buffer.is_empty() {
-                return Err(encode::Error::UnexpectedEOF);
-            }
-
-            buffer[0]
-        };
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
+        let prefix = u8::consensus_decode(&mut d)?;
 
         match prefix {
-            0 => {
-                // consume null value prefix
-                d.consume(1);
-                Ok(Nonce::Null)
-            }
+            0 => Ok(Nonce::Null),
             1 => {
-                // ignore prefix when decoding an explicit asset
-                d.consume(1);
                 let explicit = Decodable::consensus_decode(&mut d)?;
                 Ok(Nonce::Explicit(explicit))
             }
             p if p == 0x02 || p == 0x03 => {
-                let pk = Decodable::consensus_decode(&mut d)?;
-                Ok(Nonce::Confidential(pk))
+                let mut comm = [0u8; 33];
+                comm[0] = p;
+                d.read_exact(&mut comm[1..])?;
+                Ok(Nonce::Confidential(PublicKey::from_slice(&comm)?))
             }
             p => Err(encode::Error::InvalidConfidentialPrefix(p)),
         }
@@ -718,7 +666,7 @@ impl Decodable for Nonce {
 }
 
 impl Decodable for PublicKey {
-    fn consensus_decode<D: io::BufRead>(d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<D: io::Read>(d: D) -> Result<Self, encode::Error> {
         let bytes = <[u8; 33]>::consensus_decode(d)?;
         Ok(PublicKey::from_slice(&bytes)?)
     }
@@ -863,7 +811,7 @@ impl Serialize for AssetBlindingFactor {
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for AssetBlindingFactor {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<AssetBlindingFactor, D::Error> {
-        use bitcoin::hashes::hex::FromHex;
+        use crate::hex::FromHex;
 
         if d.is_human_readable() {
             struct HexVisitor;
@@ -992,14 +940,13 @@ impl AddAssign for ValueBlindingFactor {
             // for scalar arethematic, we need to abuse secret key
             // operations for this
             let sk2 = SecretKey::from_slice(self.into_inner().as_ref()).expect("Valid key");
-            let mut sk = SecretKey::from_slice(other.into_inner().as_ref()).expect("Valid key");
+            let sk = SecretKey::from_slice(other.into_inner().as_ref()).expect("Valid key");
             // The only reason that secret key addition can fail
             // is when the keys add up to zero since we have already checked
             // keys are in valid secret keys
-            if sk.add_assign(sk2.as_ref()).is_err() {
-                *self = Self::zero();
-            } else {
-                *self = ValueBlindingFactor::from_slice(sk.as_ref()).expect("Valid Tweak")
+            match sk.add_tweak(&sk2.into()) {
+                Ok(sk_tweaked) => *self = ValueBlindingFactor::from_slice(sk_tweaked.as_ref()).expect("Valid Tweak"),
+                Err(_) =>  *self = Self::zero(),
             }
         }
     }
@@ -1012,8 +959,7 @@ impl Neg for ValueBlindingFactor {
         if self.0.as_ref() == &[0u8; 32] {
             self
         } else {
-            let mut sk = SecretKey::from_slice(self.into_inner().as_ref()).expect("Valid key");
-            sk.negate_assign();
+            let sk = SecretKey::from_slice(self.into_inner().as_ref()).expect("Valid key").negate();
             ValueBlindingFactor::from_slice(sk.as_ref()).expect("Valid Tweak")
         }
     }
@@ -1068,7 +1014,7 @@ impl Serialize for ValueBlindingFactor {
 #[cfg(feature = "serde")]
 impl<'de> Deserialize<'de> for ValueBlindingFactor {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<ValueBlindingFactor, D::Error> {
-        use bitcoin::hashes::hex::FromHex;
+        use crate::hex::FromHex;
 
         if d.is_human_readable() {
             struct HexVisitor;
@@ -1133,7 +1079,10 @@ impl<'de> Deserialize<'de> for ValueBlindingFactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::sha256;
+    use crate::hashes::sha256;
+
+    #[cfg(feature = "serde")]
+    use std::str::FromStr;
 
     #[cfg(feature = "serde")]
     use bincode;
@@ -1172,7 +1121,7 @@ mod tests {
 
         let assets = [
             Asset::Null,
-            Asset::Explicit(AssetId::from_inner(sha256::Midstate::from_inner([0; 32]))),
+            Asset::Explicit(AssetId::from_inner(sha256::Midstate::from_byte_array([0; 32]))),
             Asset::from_commitment(&[
                 0x0a, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
                 1, 1, 1, 1, 1, 1,
@@ -1284,10 +1233,9 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn asset_serde() {
-        use bitcoin::hashes::hex::FromHex;
         use serde_test::{assert_tokens, Configure, Token};
 
-        let asset_id = AssetId::from_hex(
+        let asset_id = AssetId::from_str(
             "630ed6f9b176af03c0cd3f8aa430f9e7b4d988cf2d0b2f204322488f03b00bf8"
         ).unwrap();
         let asset = Asset::Explicit(asset_id);
@@ -1409,13 +1357,17 @@ mod tests {
             &[
                 Token::Seq { len: Some(2) },
                 Token::U8(2),
-                Token::Bytes(
-                    &[
-                        2,
-                        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-                        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
-                    ]
-                ),
+                Token::Tuple { len: 33 },
+                Token::U8(2), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1), Token::U8(1), Token::U8(1), Token::U8(1),
+                Token::U8(1),
+                Token::TupleEnd,
                 Token::SeqEnd
             ]
         );
@@ -1453,6 +1405,7 @@ mod tests {
     }
 
     #[cfg(feature = "serde")]
+    #[test]
     fn test_value_bincode_be() {
         let value = Value::Explicit(500);
         let bytes = bincode::serialize(&value).unwrap();

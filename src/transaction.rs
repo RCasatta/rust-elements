@@ -15,24 +15,26 @@
 //! # Transactions
 //!
 
-use std::{io, fmt, str};
+use std::{io, fmt, str, cmp};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 
 use bitcoin::{self, VarInt};
-use bitcoin::hashes::Hash;
+use crate::hashes::{Hash, sha256};
 
-use confidential;
-use encode::{self, Encodable, Decodable};
-use issuance::AssetId;
-use opcodes;
-use script::Instruction;
-use {Script, Txid, Wtxid};
+use crate::{confidential, ContractHash};
+use crate::encode::{self, Encodable, Decodable};
+use crate::issuance::AssetId;
+use crate::opcodes;
+use crate::parse::impl_parse_str_through_int;
+use crate::script::Instruction;
+use crate::{LockTime, Script, Txid, Wtxid};
 use secp256k1_zkp::{
-    RangeProof, SurjectionProof, Tweak,
+    RangeProof, SurjectionProof, Tweak, ZERO_TWEAK,
 };
 
 /// Description of an asset issuance in a transaction input
-#[derive(Copy, Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct AssetIssuance {
     /// Zero for a new asset issuance; otherwise a blinding factor for the input
     pub asset_blinding_nonce: Tweak,
@@ -43,8 +45,31 @@ pub struct AssetIssuance {
     /// Amount of inflation keys to issue
     pub inflation_keys: confidential::Value,
 }
+
+impl AssetIssuance {
+    /// Create a null issuance.
+    pub fn null() -> Self {
+        AssetIssuance {
+            asset_blinding_nonce: ZERO_TWEAK,
+            asset_entropy: [0; 32],
+            amount: confidential::Value::Null,
+            inflation_keys: confidential::Value::Null,
+        }
+    }
+
+    /// Checks whether the [`AssetIssuance`] is null
+    pub fn is_null(&self) -> bool {
+        self.amount.is_null() && self.inflation_keys.is_null()
+    }
+}
 serde_struct_impl!(AssetIssuance, asset_blinding_nonce, asset_entropy, amount, inflation_keys);
 impl_consensus_encoding!(AssetIssuance, asset_blinding_nonce, asset_entropy, amount, inflation_keys);
+
+impl Default for AssetIssuance {
+    fn default() -> Self {
+        Self::null()
+    }
+}
 
 /// A reference to a transaction output
 #[derive(Copy, Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
@@ -73,8 +98,8 @@ impl OutPoint {
     #[inline]
     pub fn null() -> OutPoint {
         OutPoint {
-            txid: Default::default(),
-            vout: u32::max_value(),
+            txid: Txid::all_zeros(),
+            vout: u32::MAX,
         }
     }
 
@@ -100,7 +125,7 @@ impl Encodable for OutPoint {
 }
 
 impl Decodable for OutPoint {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<OutPoint, encode::Error> {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<OutPoint, encode::Error> {
         let txid = Txid::consensus_decode(&mut d)?;
         let vout = u32::consensus_decode(&mut d)?;
         Ok(OutPoint {
@@ -125,19 +150,220 @@ impl ::std::str::FromStr for OutPoint {
         }
         let bitcoin_outpoint = bitcoin::OutPoint::from_str(s)?;
         Ok(OutPoint {
-            txid: Txid::from(bitcoin_outpoint.txid.as_hash()),
+            txid: Txid::from(bitcoin_outpoint.txid.to_raw_hash()),
             vout: bitcoin_outpoint.vout,
         })
     }
 }
 
+/// Bitcoin transaction input sequence number.
+///
+/// The sequence field is used for:
+/// - Indicating whether absolute lock-time (specified in `lock_time` field of [`Transaction`])
+///   is enabled.
+/// - Indicating and encoding [BIP-68] relative lock-times.
+/// - Indicating whether a transaction opts-in to [BIP-125] replace-by-fee.
+///
+/// Note that transactions spending an output with `OP_CHECKLOCKTIMEVERIFY`MUST NOT use
+/// `Sequence::MAX` for the corresponding input. [BIP-65]
+///
+/// [BIP-65]: <https://github.com/bitcoin/bips/blob/master/bip-0065.mediawiki>
+/// [BIP-68]: <https://github.com/bitcoin/bips/blob/master/bip-0068.mediawiki>
+/// [BIP-125]: <https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki>
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
+pub struct Sequence(pub u32);
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+/// An error in creating relative lock-times.
+pub enum RelativeLockTimeError {
+    /// The input was too large
+    IntegerOverflow(u32)
+}
+
+impl Sequence {
+    /// The maximum allowable sequence number.
+    ///
+    /// This sequence number disables lock-time and replace-by-fee.
+    pub const MAX: Self = Sequence(0xFFFFFFFF);
+    /// Zero value sequence.
+    ///
+    /// This sequence number enables replace-by-fee and lock-time.
+    pub const ZERO: Self = Sequence(0);
+    /// The sequence number that enables absolute lock-time but disables replace-by-fee
+    /// and relative lock-time.
+    pub const ENABLE_LOCKTIME_NO_RBF: Self = Sequence::MIN_NO_RBF;
+    /// The sequence number that enables replace-by-fee and absolute lock-time but
+    /// disables relative lock-time.
+    pub const ENABLE_RBF_NO_LOCKTIME: Self = Sequence(0xFFFFFFFD);
+
+    /// The lowest sequence number that does not opt-in for replace-by-fee.
+    ///
+    /// A transaction is considered to have opted in to replacement of itself
+    /// if any of it's inputs have a `Sequence` number less than this value
+    /// (Explicit Signalling [BIP-125]).
+    ///
+    /// [BIP-125]: <https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki]>
+    const MIN_NO_RBF: Self = Sequence(0xFFFFFFFE);
+    /// BIP-68 relative lock-time disable flag mask
+    const LOCK_TIME_DISABLE_FLAG_MASK: u32 = 0x80000000;
+    /// BIP-68 relative lock-time type flag mask
+    const LOCK_TYPE_MASK: u32 = 0x00400000;
+
+    /// Returns `true` if the sequence number indicates that the transaction is finalised.
+    ///
+    /// The sequence number being equal to 0xffffffff on all txin sequences indicates
+    /// that the transaction is finalised.
+    #[inline]
+    pub fn is_final(&self) -> bool {
+        *self == Sequence::MAX
+    }
+
+    /// Returns true if the transaction opted-in to BIP125 replace-by-fee.
+    ///
+    /// Replace by fee is signaled by the sequence being less than 0xfffffffe which is checked by this method.
+    #[inline]
+    pub fn is_rbf(&self) -> bool {
+        *self < Sequence::MIN_NO_RBF
+    }
+
+    /// Returns `true` if the sequence has a relative lock-time.
+    #[inline]
+    pub fn is_relative_lock_time(&self) -> bool {
+        self.0 & Sequence::LOCK_TIME_DISABLE_FLAG_MASK == 0
+    }
+
+    /// Returns `true` if the sequence number encodes a block based relative lock-time.
+    #[inline]
+    pub fn is_height_locked(&self) -> bool {
+        self.is_relative_lock_time() & (self.0 & Sequence::LOCK_TYPE_MASK == 0)
+    }
+
+    /// Returns `true` if the sequene number encodes a time interval based relative lock-time.
+    #[inline]
+    pub fn is_time_locked(&self) -> bool {
+        self.is_relative_lock_time() & (self.0 & Sequence::LOCK_TYPE_MASK > 0)
+    }
+
+    /// Create a relative lock-time using block height.
+    #[inline]
+    pub fn from_height(height: u16) -> Self {
+        Sequence(u32::from(height))
+    }
+
+    /// Create a relative lock-time using time intervals where each interval is equivalent
+    /// to 512 seconds.
+    ///
+    /// Encoding finer granularity of time for relative lock-times is not supported in Bitcoin
+    #[inline]
+    pub fn from_512_second_intervals(intervals: u16) -> Self {
+        Sequence(u32::from(intervals) | Sequence::LOCK_TYPE_MASK)
+    }
+
+    /// Create a relative lock-time from seconds, converting the seconds into 512 second
+    /// interval with floor division.
+    ///
+    /// Will return an error if the input cannot be encoded in 16 bits.
+    #[inline]
+    pub fn from_seconds_floor(seconds: u32) -> Result<Self, RelativeLockTimeError> {
+        if let Ok(interval) = u16::try_from(seconds / 512) {
+            Ok(Sequence::from_512_second_intervals(interval))
+        } else {
+            Err(RelativeLockTimeError::IntegerOverflow(seconds))
+        }
+    }
+
+    /// Create a relative lock-time from seconds, converting the seconds into 512 second
+    /// interval with ceiling division.
+    ///
+    /// Will return an error if the input cannot be encoded in 16 bits.
+    #[inline]
+    pub fn from_seconds_ceil(seconds: u32) -> Result<Self, RelativeLockTimeError> {
+        if let Ok(interval) = u16::try_from((seconds + 511) / 512) {
+            Ok(Sequence::from_512_second_intervals(interval))
+        } else {
+            Err(RelativeLockTimeError::IntegerOverflow(seconds))
+        }
+    }
+
+    /// Returns `true` if the sequence number enables absolute lock-time ([`Transaction::lock_time`]).
+    #[inline]
+    pub fn enables_absolute_lock_time(&self) -> bool {
+        !self.is_final()
+    }
+
+    /// Create a sequence from a u32 value.
+    #[inline]
+    pub fn from_consensus(n: u32) -> Self {
+        Sequence(n)
+    }
+
+    /// Returns the inner 32bit integer value of Sequence.
+    #[inline]
+    pub fn to_consensus_u32(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for Sequence {
+    /// The default value of sequence is 0xffffffff.
+    fn default() -> Self {
+        Sequence::MAX
+    }
+}
+
+impl From<Sequence> for u32 {
+    fn from(sequence: Sequence) -> u32 {
+        sequence.0
+    }
+}
+
+impl fmt::Display for Sequence {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for Sequence {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::UpperHex for Sequence {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, f)
+    }
+}
+
+impl fmt::Display for RelativeLockTimeError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::IntegerOverflow(val) => write!(f, "input of {} was too large", val)
+        }
+    }
+}
+
+impl_parse_str_through_int!(Sequence);
+
+impl std::error::Error for RelativeLockTimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IntegerOverflow(_) => None
+        }
+    }
+}
+
+
 /// Transaction input witness
-#[derive(Clone, Default, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct TxInWitness {
     /// Amount rangeproof
-    pub amount_rangeproof: Option<RangeProof>,
+    pub amount_rangeproof: Option<Box<RangeProof>>,
     /// Rangeproof for inflation keys
-    pub inflation_keys_rangeproof: Option<RangeProof>,
+    pub inflation_keys_rangeproof: Option<Box<RangeProof>>,
     /// Traditional script witness
     pub script_witness: Vec<Vec<u8>>,
     /// Pegin witness, basically the same thing
@@ -147,6 +373,16 @@ serde_struct_impl!(TxInWitness, amount_rangeproof, inflation_keys_rangeproof, sc
 impl_consensus_encoding!(TxInWitness, amount_rangeproof, inflation_keys_rangeproof, script_witness, pegin_witness);
 
 impl TxInWitness {
+    /// Create an empty input witness.
+    pub fn empty() -> Self {
+        TxInWitness {
+            amount_rangeproof: None,
+            inflation_keys_rangeproof: None,
+            script_witness: Vec::new(),
+            pegin_witness: Vec::new(),
+        }
+    }
+
     /// Whether this witness is null
     pub fn is_empty(&self) -> bool {
         self.amount_rangeproof.is_none() &&
@@ -156,16 +392,22 @@ impl TxInWitness {
     }
 }
 
+impl Default for TxInWitness {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 
 /// Parsed data from a transaction input's pegin witness
-#[derive(Copy, Clone, Default, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 pub struct PeginData<'tx> {
     /// Reference to the pegin output on the mainchain
     pub outpoint: bitcoin::OutPoint,
     /// The value, in satoshis, of the pegin
     pub value: u64,
     /// Asset type being pegged in
-    pub asset: confidential::Asset,
+    pub asset: AssetId,
     /// Hash of genesis block of originating blockchain
     pub genesis_hash: bitcoin::BlockHash,
     /// The claim script that we should hash to tweak our address. Unparsed
@@ -173,7 +415,7 @@ pub struct PeginData<'tx> {
     /// to feed it raw into a hash function.
     pub claim_script: &'tx [u8],
     /// Mainchain transaction; not parsed to save time/memory since the
-    /// parsed transaction is typically not useful without auxillary
+    /// parsed transaction is typically not useful without auxiliary
     /// data (e.g. knowing how to compute pegin addresses for the
     /// sidechain).
     pub tx: &'tx [u8],
@@ -184,15 +426,63 @@ pub struct PeginData<'tx> {
     pub referenced_block: bitcoin::BlockHash,
 }
 
+impl<'tx> PeginData<'tx> {
+    /// Construct the pegin data from a pegin witness.
+    /// Returns None if not a valid pegin witness.
+    pub fn from_pegin_witness(
+        pegin_witness: &'tx [Vec<u8>],
+        prevout: bitcoin::OutPoint,
+    ) -> Result<PeginData<'tx>, &'static str> {
+        if pegin_witness.len() != 6 {
+            return Err("size not 6");
+        }
+        if pegin_witness[5].len() < 80 {
+            return Err("merkle proof too short");
+        }
+
+        Ok(PeginData {
+            outpoint: prevout,
+            value: bitcoin::consensus::deserialize(&pegin_witness[0]).map_err(|_| "invalid value")?,
+            asset: encode::deserialize(&pegin_witness[1]).map_err(|_| "invalid asset")?,
+            genesis_hash: bitcoin::consensus::deserialize(&pegin_witness[2])
+                .map_err(|_| "invalid genesis hash")?,
+            claim_script: &pegin_witness[3],
+            tx: &pegin_witness[4],
+            merkle_proof: &pegin_witness[5],
+            referenced_block: bitcoin::BlockHash::hash(&pegin_witness[5][0..80]),
+        })
+    }
+
+    /// Construct a pegin witness from the pegin data.
+    pub fn to_pegin_witness(&self) -> Vec<Vec<u8>> {
+        vec![
+            bitcoin::consensus::serialize(&self.value),
+            encode::serialize(&self.asset),
+            bitcoin::consensus::serialize(&self.genesis_hash),
+            self.claim_script.to_vec(),
+            self.tx.to_vec(),
+            self.merkle_proof.to_vec(),
+        ]
+    }
+
+    /// Parse the mainchain tx provided as pegin data.
+    pub fn parse_tx(&self) -> Result<bitcoin::Transaction, bitcoin::consensus::encode::Error> {
+        bitcoin::consensus::encode::deserialize(self.tx)
+    }
+
+    /// Parse the merkle inclusion proof provided as pegin data.
+    pub fn parse_merkle_proof(&self) -> Result<bitcoin::MerkleBlock, bitcoin::consensus::encode::Error> {
+        bitcoin::consensus::encode::deserialize(self.merkle_proof)
+    }
+}
+
 /// A transaction input, which defines old coins to be consumed
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct TxIn {
     /// The reference to the previous output that is being used an an input
     pub previous_output: OutPoint,
     /// Flag indicating that `previous_outpoint` refers to something on the main chain
     pub is_pegin: bool,
-    /// Flag indicating that `previous_outpoint` has an asset issuance attached
-    pub has_issuance: bool,
     /// The script which pushes values on the stack which will cause
     /// the referenced output's script to accept
     pub script_sig: Script,
@@ -200,7 +490,7 @@ pub struct TxIn {
     /// conflicting transactions should be preferred, or 0xFFFFFFFF
     /// to ignore this feature. This is generally never used since
     /// the miner behaviour cannot be enforced.
-    pub sequence: u32,
+    pub sequence: Sequence,
     /// Asset issuance data
     pub asset_issuance: AssetIssuance,
     /// Witness data - not deserialized/serialized as part of a `TxIn` object
@@ -208,7 +498,21 @@ pub struct TxIn {
     /// part of the txin.
     pub witness: TxInWitness,
 }
-serde_struct_impl!(TxIn, previous_output, is_pegin, has_issuance, script_sig, sequence, asset_issuance, witness);
+
+impl Default for TxIn {
+    fn default() -> Self {
+        Self {
+            previous_output: Default::default(), // same as in rust-bitcoin
+            is_pegin: false,
+            script_sig: Script::new(),
+            sequence: Sequence::MAX, // same as in rust-bitcoin
+            asset_issuance: Default::default(),
+            witness: Default::default()
+        }
+    }
+}
+
+serde_struct_impl!(TxIn, previous_output, is_pegin, script_sig, sequence, asset_issuance, witness);
 
 impl Encodable for TxIn {
     fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, encode::Error> {
@@ -217,7 +521,7 @@ impl Encodable for TxIn {
         if self.is_pegin {
             vout |= 1 << 30;
         }
-        if self.has_issuance {
+        if self.has_issuance() {
             vout |= 1 << 31;
         }
         ret += self.previous_output.txid.consensus_encode(&mut s)?;
@@ -232,10 +536,10 @@ impl Encodable for TxIn {
 }
 
 impl Decodable for TxIn {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<TxIn, encode::Error> {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<TxIn, encode::Error> {
         let mut outp = OutPoint::consensus_decode(&mut d)?;
         let script_sig = Script::consensus_decode(&mut d)?;
-        let sequence = u32::consensus_decode(&mut d)?;
+        let sequence = Sequence::consensus_decode(&mut d)?;
         let issuance;
         let is_pegin;
         let has_issuance;
@@ -251,13 +555,15 @@ impl Decodable for TxIn {
         }
         if has_issuance {
             issuance = AssetIssuance::consensus_decode(&mut d)?;
+            if issuance.is_null() {
+                return Err(encode::Error::ParseFailed("superfluous asset issuance"));
+            }
         } else {
             issuance = AssetIssuance::default();
         }
         Ok(TxIn {
             previous_output: outp,
             is_pegin,
-            has_issuance,
             script_sig,
             sequence,
             asset_issuance: issuance,
@@ -278,60 +584,83 @@ impl TxIn {
         self.is_pegin
     }
 
+    /// In case of a pegin input, returns the Bitcoin prevout.
+    pub fn pegin_prevout(&self) -> Option<bitcoin::OutPoint> {
+        if self.is_pegin {
+            // here we have to cast the previous_output to a bitcoin one
+            Some(bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array(
+                    self.previous_output.txid.to_byte_array()
+                ),
+                vout: self.previous_output.vout,
+            })
+        } else {
+            None
+        }
+    }
+
     /// Extracts witness data from a pegin. Will return `None` if any data
     /// cannot be parsed. The combination of `is_pegin()` returning `true`
     /// and `pegin_data()` returning `None` indicates an invalid transaction.
     pub fn pegin_data(&self) -> Option<PeginData> {
-        if !self.is_pegin {
-            return None
-        }
-
-        if self.witness.pegin_witness.len() != 6 {
-            return None
-        }
-
-        macro_rules! opt_try(
-            ($res:expr) => { match $res { Ok(x) => x, Err(_) => return None } }
-        );
-
-        Some(PeginData {
-            // Cast of an elements::OutPoint to a bitcoin::OutPoint
-            outpoint: bitcoin::OutPoint {
-                txid: bitcoin::Txid::from(self.previous_output.txid.as_hash()),
-                vout: self.previous_output.vout,
-            },
-            value: opt_try!(bitcoin::consensus::deserialize(&self.witness.pegin_witness[0])),
-            asset: confidential::Asset::Explicit(
-                opt_try!(encode::deserialize(&self.witness.pegin_witness[1])),
-            ),
-            genesis_hash: opt_try!(bitcoin::consensus::deserialize(&self.witness.pegin_witness[2])),
-            claim_script: &self.witness.pegin_witness[3],
-            tx: &self.witness.pegin_witness[4],
-            merkle_proof: &self.witness.pegin_witness[5],
-            referenced_block: bitcoin::BlockHash::hash(
-                &self.witness.pegin_witness[5][0..80],
-            ),
+        self.pegin_prevout().and_then(|p| {
+            PeginData::from_pegin_witness(&self.witness.pegin_witness, p).ok()
         })
     }
 
     /// Helper to determine whether an input has an asset issuance attached
     pub fn has_issuance(&self) -> bool {
-        self.has_issuance
+        !&self.asset_issuance.is_null()
+    }
+
+    /// Obtain the outpoint flag corresponding to this input
+    pub fn outpoint_flag(&self) -> u8 {
+        ((self.is_pegin as u8) << 6 ) | ((self.has_issuance() as u8) << 7)
+    }
+
+    /// Compute the issuance asset ids from this [`TxIn`]. This function does not check
+    /// whether there is an issuance in this input. Returns (asset_id, token_id)
+    pub fn issuance_ids(&self) -> (AssetId, AssetId) {
+        let entropy = if self.asset_issuance.asset_blinding_nonce == ZERO_TWEAK {
+            let contract_hash =
+                ContractHash::from_byte_array(self.asset_issuance.asset_entropy);
+            AssetId::generate_asset_entropy(self.previous_output, contract_hash)
+        } else {
+            // re-issuance
+            sha256::Midstate::from_byte_array(self.asset_issuance.asset_entropy)
+        };
+        let asset_id = AssetId::from_entropy(entropy);
+        let token_id =
+            AssetId::reissuance_token_from_entropy(entropy, self.asset_issuance.amount.is_confidential());
+
+        (asset_id, token_id)
     }
 }
 
 /// Transaction output witness
-#[derive(Clone, Default, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct TxOutWitness {
     /// Surjection proof showing that the asset commitment is legitimate
-    pub surjection_proof: Option<SurjectionProof>,
+    // We Box it because surjection proof internally is an array [u8; N] that
+    // allocates on stack even when the surjection proof is empty
+    pub surjection_proof: Option<Box<SurjectionProof>>,
     /// Rangeproof showing that the value commitment is legitimate
-    pub rangeproof: Option<RangeProof>,
+    // We Box it because range proof internally is an array [u8; N] that
+    // allocates on stack even when the range proof is empty
+    pub rangeproof: Option<Box<RangeProof>>,
 }
 serde_struct_impl!(TxOutWitness, surjection_proof, rangeproof);
 impl_consensus_encoding!(TxOutWitness, surjection_proof, rangeproof);
 
 impl TxOutWitness {
+    /// Create an empty output witness.
+    pub fn empty() -> Self {
+        TxOutWitness {
+            surjection_proof: None,
+            rangeproof: None,
+        }
+    }
+
     /// Whether this witness is null
     pub fn is_empty(&self) -> bool {
         self.surjection_proof.is_none() && self.rangeproof.is_none()
@@ -348,8 +677,14 @@ impl TxOutWitness {
     }
 }
 
+impl Default for TxOutWitness {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
 /// Information about a pegout
-#[derive(Clone, Default, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct PegoutData<'txo> {
     /// Amount to peg out
     pub value: u64,
@@ -358,13 +693,13 @@ pub struct PegoutData<'txo> {
     /// Genesis hash of the target blockchain
     pub genesis_hash: bitcoin::BlockHash,
     /// Scriptpubkey to create on the target blockchain
-    pub script_pubkey: bitcoin::Script,
+    pub script_pubkey: bitcoin::ScriptBuf,
     /// Remaining pegout data used by some forks of Elements
     pub extra_data: Vec<&'txo [u8]>,
 }
 
 /// Transaction output
-#[derive(Clone, Default, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Default, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub struct TxOut {
     /// Committed asset
     pub asset: confidential::Asset,
@@ -391,7 +726,7 @@ impl Encodable for TxOut {
 }
 
 impl Decodable for TxOut {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<TxOut, encode::Error> {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<TxOut, encode::Error> {
         Ok(TxOut {
             asset: Decodable::consensus_decode(&mut d)?,
             value: Decodable::consensus_decode(&mut d)?,
@@ -403,7 +738,6 @@ impl Decodable for TxOut {
 }
 
 impl TxOut {
-
     /// Create a new fee output.
     pub fn new_fee(amount: u64, asset: AssetId) -> TxOut {
         TxOut {
@@ -450,37 +784,22 @@ impl TxOut {
         }
 
         // Must have an explicit value
-        let value = if let confidential::Value::Explicit(val) = self.value {
-            val
-        } else {
-            return None;
-        };
+        let value = self.value.explicit()?;
 
         let mut iter = self.script_pubkey.instructions();
 
         iter.next(); // Skip OP_RETURN
 
         // Parse destination chain's genesis block
-        let genesis_hash = if let Some(Ok(Instruction::PushBytes(data))) = iter.next() {
-            if let Ok(hash) = bitcoin::BlockHash::from_slice(data) {
-                hash
-            } else {
-                return None;
-            }
-        } else {
-            return None;
-        };
+        let genesis_hash = bitcoin::BlockHash::from_raw_hash(
+            crate::hashes::Hash::from_slice(iter.next()?.ok()?.push_bytes()?).ok()?
+        );
 
         // Parse destination scriptpubkey
-        let script_pubkey = if let Some(Ok(Instruction::PushBytes(data))) = iter.next() {
-            if data.is_empty() {
-                return None;
-            } else {
-                bitcoin::Script::from(data.to_owned())
-            }
-        } else {
+        let script_pubkey = bitcoin::ScriptBuf::from(iter.next()?.ok()?.push_bytes()?.to_owned());
+        if script_pubkey.len() == 0 {
             return None;
-        };
+        }
 
         // Return everything
         let mut found_non_data_push = false;
@@ -553,12 +872,12 @@ impl TxOut {
 }
 
 /// Elements transaction
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Transaction {
     /// Transaction version field (should always be 2)
     pub version: u32,
     /// Transaction locktime
-    pub lock_time: u32,
+    pub lock_time: LockTime,
     /// Vector of inputs
     pub input: Vec<TxIn>,
     /// Vector of outputs
@@ -580,22 +899,72 @@ impl Transaction {
 
     /// Get the "weight" of this transaction; roughly equivalent to BIP141, in that witness data is
     /// counted as 1 while non-witness data is counted as 4.
+    #[deprecated(since = "0.19.1", note = "Please use `Transaction::weight` instead.")]
     pub fn get_weight(&self) -> usize {
-        self.get_scaled_size(4)
+        self.weight()
+    }
+
+    /// Get the "weight" of this transaction; roughly equivalent to BIP141, in that witness data is
+    /// counted as 1 while non-witness data is counted as 4.
+    pub fn weight(&self) -> usize {
+        self.scaled_size(4)
     }
 
     /// Gets the regular byte-wise consensus-serialized size of this transaction.
+    #[deprecated(since = "0.19.1", note = "Please use `Transaction::size` instead.")]
     pub fn get_size(&self) -> usize {
-        self.get_scaled_size(1)
+        self.size()
     }
 
-    fn get_scaled_size(&self, scale_factor: usize) -> usize {
+    /// Gets the regular byte-wise consensus-serialized size of this transaction.
+    pub fn size(&self) -> usize {
+        self.scaled_size(1)
+    }
+
+    /// Returns the "virtual size" (vsize) of this transaction.
+    ///
+    /// Will be `ceil(weight / 4.0)`.
+    #[inline]
+    pub fn vsize(&self) -> usize {
+        let weight = self.weight();
+        (weight + 4 - 1) / 4
+    }
+
+    /// Get the "discount weight" of this transaction; this is the weight minus the output witnesses and minus the
+    /// differences between asset and nonce commitments from their explicit values.
+    pub fn discount_weight(&self) -> usize {
+        let mut weight = self.scaled_size(4);
+
+        for out in self.output.iter() {
+            let rp_len = out.witness.rangeproof_len();
+            let sp_len = out.witness.surjectionproof_len();
+            let witness_weight = VarInt(sp_len as u64).size() + sp_len + VarInt(rp_len as u64).size() + rp_len;
+            weight -= witness_weight.saturating_sub(2); // explicit transactions have 1 byte for each empty proof
+            if out.value.is_confidential() {
+                weight -= 33 - 9;
+            }
+            if out.nonce.is_confidential() {
+                weight -= 33 - 1;
+            }
+        }
+
+        weight
+    }
+
+    /// Returns the "discount virtual size" (discountvsize) of this transaction.
+    ///
+    /// Will be `ceil(discount weight / 4.0)`.
+    pub fn discount_vsize(&self) -> usize {
+        (self.discount_weight() + 4 - 1) / 4
+    }
+
+    fn scaled_size(&self, scale_factor: usize) -> usize {
         let witness_flag = self.has_witness();
 
         let input_weight = self.input.iter().map(|input| {
             scale_factor * (
                 32 + 4 + 4 + // output + nSequence
-                VarInt(input.script_sig.len() as u64).len() as usize +
+                VarInt(input.script_sig.len() as u64).size() +
                 input.script_sig.len() + if input.has_issuance() {
                     64 +
                     input.asset_issuance.amount.encoded_length() +
@@ -609,18 +978,18 @@ impl Transaction {
                 let keys_prf_len = input.witness.inflation_keys_rangeproof.as_ref()
                     .map(|x| x.len()).unwrap_or(0);
 
-                VarInt(amt_prf_len as u64).len() as usize +
+                VarInt(amt_prf_len as u64).size() +
                 amt_prf_len +
-                VarInt(keys_prf_len as u64).len() as usize +
+                VarInt(keys_prf_len as u64).size() +
                 keys_prf_len +
-                VarInt(input.witness.script_witness.len() as u64).len() as usize +
+                VarInt(input.witness.script_witness.len() as u64).size() +
                 input.witness.script_witness.iter().map(|wit|
-                    VarInt(wit.len() as u64).len() as usize +
+                    VarInt(wit.len() as u64).size() +
                     wit.len()
                 ).sum::<usize>() +
-                VarInt(input.witness.pegin_witness.len() as u64).len() as usize +
+                VarInt(input.witness.pegin_witness.len() as u64).size() +
                 input.witness.pegin_witness.iter().map(|wit|
-                    VarInt(wit.len() as u64).len() as usize +
+                    VarInt(wit.len() as u64).size() +
                     wit.len()
                 ).sum::<usize>()
             } else {
@@ -633,14 +1002,14 @@ impl Transaction {
                 output.asset.encoded_length() +
                 output.value.encoded_length() +
                 output.nonce.encoded_length() +
-                VarInt(output.script_pubkey.len() as u64).len() as usize +
+                VarInt(output.script_pubkey.len() as u64).size() +
                 output.script_pubkey.len()
             ) + if witness_flag {
                 let range_prf_len = output.witness.rangeproof_len();
                 let surj_prf_len = output.witness.surjectionproof_len();
-                VarInt(surj_prf_len as u64).len() as usize +
+                VarInt(surj_prf_len as u64).size() +
                 surj_prf_len +
-                VarInt(range_prf_len as u64).len() as usize +
+                VarInt(range_prf_len as u64).size() +
                 range_prf_len
             } else {
                 0
@@ -650,8 +1019,8 @@ impl Transaction {
         scale_factor * (
             4 + // version
             4 + // locktime
-            VarInt(self.input.len() as u64).len() as usize +
-            VarInt(self.output.len() as u64).len() as usize +
+            VarInt(self.input.len() as u64).size() +
+            VarInt(self.output.len() as u64).size() +
             1 // segwit flag byte (note this is *not* witness data in Elements)
         ) + input_weight + output_weight
     }
@@ -696,6 +1065,18 @@ impl Transaction {
     }
 }
 
+impl Encodable for Sequence {
+    fn consensus_encode<W: io::Write>(&self, w: W) -> Result<usize, encode::Error> {
+        self.0.consensus_encode(w)
+    }
+}
+
+impl Decodable for Sequence {
+    fn consensus_decode<R: io::Read>(r: R) -> Result<Self, encode::Error> {
+        Decodable::consensus_decode(r).map(Sequence)
+    }
+}
+
 impl Encodable for Transaction {
     fn consensus_encode<S: io::Write>(&self, mut s: S) -> Result<usize, encode::Error> {
         let mut ret = 0;
@@ -724,12 +1105,12 @@ impl Encodable for Transaction {
 }
 
 impl Decodable for Transaction {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Transaction, encode::Error> {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Transaction, encode::Error> {
         let version = u32::consensus_decode(&mut d)?;
         let wit_flag = u8::consensus_decode(&mut d)?;
         let mut input = Vec::<TxIn>::consensus_decode(&mut d)?;
         let mut output = Vec::<TxOut>::consensus_decode(&mut d)?;
-        let lock_time = u32::consensus_decode(&mut d)?;
+        let lock_time = LockTime::consensus_decode(&mut d)?;
 
         match wit_flag {
             0 => Ok(Transaction {
@@ -761,10 +1142,30 @@ impl Decodable for Transaction {
         }
     }
 }
+
+impl cmp::PartialOrd for Transaction {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl cmp::Ord for Transaction {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.version
+            .cmp(&other.version)
+            .then(
+                self.lock_time
+                    .to_consensus_u32()
+                    .cmp(&other.lock_time.to_consensus_u32()),
+            )
+            .then(self.input.cmp(&other.input))
+            .then(self.output.cmp(&other.output))
+    }
+}
+
 /// Hashtype of a transaction, encoded in the last byte of a signature
 /// Fixed values so they can be casted as integer types for encoding
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
-pub enum SigHashType {
+pub enum EcdsaSighashType {
     /// 0x1: Sign all outputs
     All = 0x01,
     /// 0x2: Sign no outputs --- anyone can choose the destination
@@ -782,64 +1183,64 @@ pub enum SigHashType {
     SinglePlusAnyoneCanPay = 0x83,
 }
 
-serde_string_impl!(SigHashType, "a SigHashType data");
+serde_string_impl!(EcdsaSighashType, "a EcdsaSighashType data");
 
-impl fmt::Display for SigHashType {
+impl fmt::Display for EcdsaSighashType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
-            SigHashType::All => "SIGHASH_ALL",
-            SigHashType::None => "SIGHASH_NONE",
-            SigHashType::Single => "SIGHASH_SINGLE",
-            SigHashType::AllPlusAnyoneCanPay => "SIGHASH_ALL|SIGHASH_ANYONECANPAY",
-            SigHashType::NonePlusAnyoneCanPay => "SIGHASH_NONE|SIGHASH_ANYONECANPAY",
-            SigHashType::SinglePlusAnyoneCanPay => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY",
+            EcdsaSighashType::All => "SIGHASH_ALL",
+            EcdsaSighashType::None => "SIGHASH_NONE",
+            EcdsaSighashType::Single => "SIGHASH_SINGLE",
+            EcdsaSighashType::AllPlusAnyoneCanPay => "SIGHASH_ALL|SIGHASH_ANYONECANPAY",
+            EcdsaSighashType::NonePlusAnyoneCanPay => "SIGHASH_NONE|SIGHASH_ANYONECANPAY",
+            EcdsaSighashType::SinglePlusAnyoneCanPay => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY",
         };
         f.write_str(s)
     }
 }
 
-impl str::FromStr for SigHashType {
+impl str::FromStr for EcdsaSighashType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.as_ref() {
-            "SIGHASH_ALL" => Ok(SigHashType::All),
-            "SIGHASH_NONE" => Ok(SigHashType::None),
-            "SIGHASH_SINGLE" => Ok(SigHashType::Single),
-            "SIGHASH_ALL|SIGHASH_ANYONECANPAY" => Ok(SigHashType::AllPlusAnyoneCanPay),
-            "SIGHASH_NONE|SIGHASH_ANYONECANPAY" => Ok(SigHashType::NonePlusAnyoneCanPay),
-            "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY" => Ok(SigHashType::SinglePlusAnyoneCanPay),
+        match s {
+            "SIGHASH_ALL" => Ok(EcdsaSighashType::All),
+            "SIGHASH_NONE" => Ok(EcdsaSighashType::None),
+            "SIGHASH_SINGLE" => Ok(EcdsaSighashType::Single),
+            "SIGHASH_ALL|SIGHASH_ANYONECANPAY" => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
+            "SIGHASH_NONE|SIGHASH_ANYONECANPAY" => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
+            "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY" => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
             _ => Err("can't recognize SIGHASH string".to_string())
         }
     }
 }
 
-impl SigHashType {
+impl EcdsaSighashType {
     /// Break the sighash flag into the "real" sighash flag and the ANYONECANPAY boolean
-    pub(crate) fn split_anyonecanpay_flag(self) -> (SigHashType, bool) {
+    pub(crate) fn split_anyonecanpay_flag(self) -> (EcdsaSighashType, bool) {
         match self {
-            SigHashType::All => (SigHashType::All, false),
-            SigHashType::None => (SigHashType::None, false),
-            SigHashType::Single => (SigHashType::Single, false),
-            SigHashType::AllPlusAnyoneCanPay => (SigHashType::All, true),
-            SigHashType::NonePlusAnyoneCanPay => (SigHashType::None, true),
-            SigHashType::SinglePlusAnyoneCanPay => (SigHashType::Single, true),
+            EcdsaSighashType::All => (EcdsaSighashType::All, false),
+            EcdsaSighashType::None => (EcdsaSighashType::None, false),
+            EcdsaSighashType::Single => (EcdsaSighashType::Single, false),
+            EcdsaSighashType::AllPlusAnyoneCanPay => (EcdsaSighashType::All, true),
+            EcdsaSighashType::NonePlusAnyoneCanPay => (EcdsaSighashType::None, true),
+            EcdsaSighashType::SinglePlusAnyoneCanPay => (EcdsaSighashType::Single, true),
         }
     }
 
     /// Reads a 4-byte uint32 as a sighash type
-    pub fn from_u32(n: u32) -> SigHashType {
+    pub fn from_u32(n: u32) -> EcdsaSighashType {
         match n & 0x9f {
             // "real" sighashes
-            0x01 => SigHashType::All,
-            0x02 => SigHashType::None,
-            0x03 => SigHashType::Single,
-            0x81 => SigHashType::AllPlusAnyoneCanPay,
-            0x82 => SigHashType::NonePlusAnyoneCanPay,
-            0x83 => SigHashType::SinglePlusAnyoneCanPay,
+            0x01 => EcdsaSighashType::All,
+            0x02 => EcdsaSighashType::None,
+            0x03 => EcdsaSighashType::Single,
+            0x81 => EcdsaSighashType::AllPlusAnyoneCanPay,
+            0x82 => EcdsaSighashType::NonePlusAnyoneCanPay,
+            0x83 => EcdsaSighashType::SinglePlusAnyoneCanPay,
             // catchalls
-            x if x & 0x80 == 0x80 => SigHashType::AllPlusAnyoneCanPay,
-            _ => SigHashType::All,
+            x if x & 0x80 == 0x80 => EcdsaSighashType::AllPlusAnyoneCanPay,
+            _ => EcdsaSighashType::All,
         }
     }
 
@@ -847,17 +1248,65 @@ impl SigHashType {
     pub fn as_u32(self) -> u32 {
         self as u32
     }
+
+    /// Creates an [`EcdsaSighashType`] from a raw `u32`.
+    ///
+    /// # Errors
+    ///
+    /// If `n` is a non-standard sighash value.
+    pub fn from_standard(n: u32) -> Result<EcdsaSighashType, NonStandardSighashType> {
+        match n {
+            // Standard sighashes, see https://github.com/bitcoin/bitcoin/blob/b805dbb0b9c90dadef0424e5b3bf86ac308e103e/src/script/interpreter.cpp#L189-L198
+            0x01 => Ok(EcdsaSighashType::All),
+            0x02 => Ok(EcdsaSighashType::None),
+            0x03 => Ok(EcdsaSighashType::Single),
+            0x81 => Ok(EcdsaSighashType::AllPlusAnyoneCanPay),
+            0x82 => Ok(EcdsaSighashType::NonePlusAnyoneCanPay),
+            0x83 => Ok(EcdsaSighashType::SinglePlusAnyoneCanPay),
+            non_standard => Err(NonStandardSighashType(non_standard))
+        }
+    }
 }
+
+/// This type is consensus valid but an input including it would prevent the transaction from
+/// being relayed on today's Bitcoin network.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NonStandardSighashType(pub u32);
+
+impl fmt::Display for NonStandardSighashType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Non standard sighash type {}", self.0)
+    }
+}
+
+impl std::error::Error for NonStandardSighashType {}
+
+/// Error returned for failure during parsing one of the sighash types.
+///
+/// This is currently returned for unrecognized sighash strings.
+#[derive(Debug, Clone)]
+pub struct SighashTypeParseError {
+    /// The unrecognized string we attempted to parse.
+    pub unrecognized: String,
+}
+
+impl fmt::Display for SighashTypeParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Unrecognized SIGHASH string '{}'", self.unrecognized)
+    }
+}
+
+impl ::std::error::Error for SighashTypeParseError {}
 
 #[cfg(test)]
 mod tests {
-    use bitcoin;
-    use bitcoin::hashes::hex::FromHex;
+    use std::str::FromStr;
 
-    use encode::serialize;
-    use confidential;
+    use crate::encode::serialize;
+    use crate::confidential;
+    use crate::hex::FromHex;
     use secp256k1_zkp::{self, ZERO_TWEAK};
-    use script;
+    use crate::script;
 
     use super::*;
 
@@ -865,7 +1314,7 @@ mod tests {
     fn outpoint() {
         let txid = "d0a5c455ea7221dead9513596d2f97c09943bad81a386fe61a14a6cda060e422";
         let s = format!("{}:42", txid);
-        let expected = OutPoint::new(Txid::from_hex(&txid).unwrap(), 42);
+        let expected = OutPoint::new(Txid::from_str(txid).unwrap(), 42);
         let op = ::std::str::FromStr::from_str(&s).ok();
         assert_eq!(op, Some(expected));
         // roundtrip with elements prefix
@@ -885,7 +1334,7 @@ mod tests {
 
         let tx = Transaction {
             version: 0,
-            lock_time: 0,
+            lock_time: LockTime::ZERO,
             input: vec![],
             output: vec![fee1, fee2],
         };
@@ -920,10 +1369,10 @@ mod tests {
         );
         assert_eq!(tx.input.len(), 1);
         assert_eq!(tx.output.len(), 2);
-        assert_eq!(tx.get_size(), serialize(&tx).len());
-        assert_eq!(tx.get_weight(), tx.get_size() * 4);
-        assert_eq!(tx.output[0].is_fee(), false);
-        assert_eq!(tx.output[1].is_fee(), true);
+        assert_eq!(tx.size(), serialize(&tx).len());
+        assert_eq!(tx.weight(), tx.size() * 4);
+        assert!(!tx.output[0].is_fee());
+        assert!(tx.output[1].is_fee());
         assert_eq!(tx.output[0].value, confidential::Value::Explicit(9999996700));
         assert_eq!(tx.output[1].value, confidential::Value::Explicit(      3300));
         assert_eq!(tx.output[0].minimum_value(), 9999996700);
@@ -1130,24 +1579,24 @@ mod tests {
             tx.txid().to_string(),
             "d606b563122409191e3b114a41d5611332dc58237ad5d2dccded302664fd56c4"
         );
-        assert_eq!(tx.get_size(), serialize(&tx).len());
-        assert_eq!(tx.get_weight(), 7296);
+        assert_eq!(tx.size(), serialize(&tx).len());
+        assert_eq!(tx.weight(), 7296);
         assert_eq!(tx.input.len(), 1);
-        assert_eq!(tx.input[0].is_coinbase(), false);
-        assert_eq!(tx.is_coinbase(), false);
+        assert!(!tx.input[0].is_coinbase());
+        assert!(!tx.is_coinbase());
 
         assert_eq!(tx.output.len(), 3);
-        assert_eq!(tx.output[0].is_fee(), false);
-        assert_eq!(tx.output[1].is_fee(), false);
-        assert_eq!(tx.output[2].is_fee(), true);
+        assert!(!tx.output[0].is_fee());
+        assert!(!tx.output[1].is_fee());
+        assert!(tx.output[2].is_fee());
 
         assert_eq!(tx.output[0].minimum_value(), 1);
         assert_eq!(tx.output[1].minimum_value(), 1);
         assert_eq!(tx.output[2].minimum_value(), 36480);
 
-        assert_eq!(tx.output[0].is_null_data(), false);
-        assert_eq!(tx.output[1].is_null_data(), false);
-        assert_eq!(tx.output[2].is_null_data(), false);
+        assert!(!tx.output[0].is_null_data());
+        assert!(!tx.output[1].is_null_data());
+        assert!(!tx.output[2].is_null_data());
 
         let fee_asset = "b2e15d0d7a0c94e4e2ce0fe6e8691b9e451377f6e46e8045a86f7c4b5d4f0f23".parse().unwrap();
         assert_eq!(tx.fee_in(fee_asset), 36480);
@@ -1173,18 +1622,18 @@ mod tests {
             "cc1f895908af2509e55719e662acf4a50ca4dcf0454edd718459241745e2b0aa"
         );
         assert_eq!(tx.input.len(), 1);
-        assert_eq!(tx.get_size(), serialize(&tx).len());
-        assert_eq!(tx.get_weight(), 769);
-        assert_eq!(tx.input[0].is_coinbase(), true);
-        assert_eq!(!tx.input[0].is_pegin(), true);
+        assert_eq!(tx.size(), serialize(&tx).len());
+        assert_eq!(tx.weight(), 769);
+        assert!(tx.input[0].is_coinbase());
+        assert!(!tx.input[0].is_pegin());
         assert_eq!(tx.input[0].pegin_data(), None);
-        assert_eq!(tx.is_coinbase(), true);
+        assert!(tx.is_coinbase());
 
         assert_eq!(tx.output.len(), 2);
-        assert_eq!(tx.output[0].is_null_data(), true);
-        assert_eq!(tx.output[1].is_null_data(), true);
-        assert_eq!(tx.output[0].is_pegout(), false);
-        assert_eq!(tx.output[1].is_pegout(), false);
+        assert!(tx.output[0].is_null_data());
+        assert!(tx.output[1].is_null_data());
+        assert!(!tx.output[0].is_pegout());
+        assert!(!tx.output[1].is_pegout());
         assert_eq!(tx.output[0].pegout_data(), None);
         assert_eq!(tx.output[1].pegout_data(), None);
         let fee_asset = "b2e15d0d7a0c94e4e2ce0fe6e8691b9e451377f6e46e8045a86f7c4b5d4f0f23".parse().unwrap();
@@ -1227,21 +1676,21 @@ mod tests {
             "d1402017060761d77ee516f388134660d31ce9a72e546676303ac2fc3400656f"
         );
         assert_eq!(tx.input.len(), 1);
-        assert_eq!(tx.input[0].is_coinbase(), false);
-        assert_eq!(tx.input[0].is_pegin(), true);
+        assert!(!tx.input[0].is_coinbase());
+        assert!(tx.input[0].is_pegin());
         assert_eq!(tx.input[0].witness.pegin_witness.len(), 6);
         assert_eq!(
             tx.input[0].pegin_data(),
             Some(super::PeginData {
                 outpoint: bitcoin::OutPoint {
-                    txid: bitcoin::Txid::from_hex(
+                    txid: bitcoin::Txid::from_str(
                         "c9d88eb5130365deed045eab11cfd3eea5ba32ad45fa2e156ae6ead5f1fce93f",
                     ).unwrap(),
                     vout: 0,
                 },
                 value: 100000000,
-                asset: tx.output[0].asset,
-                genesis_hash: bitcoin::BlockHash::from_hex(
+                asset: tx.output[0].asset.explicit().unwrap(),
+                genesis_hash: bitcoin::BlockHash::from_str(
                     "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
                 ).unwrap(),
                 claim_script: &[
@@ -1300,17 +1749,21 @@ mod tests {
                     0x25, 0xf8, 0x55, 0x52, 0x97, 0x11, 0xed, 0x64,
                     0x50, 0xcc, 0x9b, 0x3c, 0x95, 0x01, 0x0b,
                 ],
-                referenced_block: bitcoin::BlockHash::from_hex(
+                referenced_block: bitcoin::BlockHash::from_str(
                     "297852caf43464d8f13a3847bd602184c21474cd06760dbf9fc5e87bade234f1"
                 ).unwrap(),
             })
+        );
+        assert_eq!(
+            tx.input[0].witness.pegin_witness,
+            tx.input[0].pegin_data().unwrap().to_pegin_witness(),
         );
 
         assert_eq!(tx.output.len(), 2);
         assert!(!tx.output[0].is_null_data());
         assert!(!tx.output[1].is_null_data());
-        assert_eq!(tx.output[0].is_pegout(), false);
-        assert_eq!(tx.output[1].is_pegout(), false);
+        assert!(!tx.output[0].is_pegout());
+        assert!(!tx.output[1].is_pegout());
         assert_eq!(tx.output[0].pegout_data(), None);
         assert_eq!(tx.output[1].pegout_data(), None);
         let fee_asset = "630ed6f9b176af03c0cd3f8aa430f9e7b4d988cf2d0b2f204322488f03b00bf8".parse().unwrap();
@@ -1341,8 +1794,8 @@ mod tests {
         );
         assert_eq!(tx.input.len(), 1);
         assert_eq!(tx.output.len(), 1);
-        assert_eq!(tx.output[0].is_null_data(), true);
-        assert_eq!(tx.output[0].is_pegout(), true);
+        assert!(tx.output[0].is_null_data());
+        assert!(tx.output[0].is_pegout());
         let fee_asset = "b2e15d0d7a0c94e4e2ce0fe6e8691b9e451377f6e46e8045a86f7c4b5d4f0f23".parse().unwrap();
         assert_eq!(tx.fee_in(fee_asset), 0);
         assert!(tx.all_fees().is_empty());
@@ -1351,10 +1804,10 @@ mod tests {
             Some(super::PegoutData {
                 asset: tx.output[0].asset,
                 value: 99993900,
-                genesis_hash: bitcoin::BlockHash::from_hex(
+                genesis_hash: bitcoin::BlockHash::from_str(
                     "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
                 ).unwrap(),
-                script_pubkey: bitcoin::Script::from_hex(
+                script_pubkey: bitcoin::ScriptBuf::from_hex(
                     "76a914bedb324be05d1a1254afeb3e7ef40fea0368bc1e88ac"
                 ).unwrap(),
                 extra_data: vec![
@@ -1380,7 +1833,7 @@ mod tests {
             })
         );
 
-        let expected_asset_id = AssetId::from_hex("630ed6f9b176af03c0cd3f8aa430f9e7b4d988cf2d0b2f204322488f03b00bf8").unwrap();
+        let expected_asset_id = AssetId::from_str("630ed6f9b176af03c0cd3f8aa430f9e7b4d988cf2d0b2f204322488f03b00bf8").unwrap();
         if let confidential::Asset::Explicit(asset_id) = tx.output[0].asset {
             assert_eq!(expected_asset_id, asset_id);
         } else {
@@ -1696,7 +2149,7 @@ mod tests {
         );
         assert_eq!(tx.input.len(), 1);
         assert_eq!(tx.output.len(), 3);
-        assert_eq!(tx.input[0].has_issuance, true);
+        assert!(tx.input[0].has_issuance());
         let fee_asset = "b2e15d0d7a0c94e4e2ce0fe6e8691b9e451377f6e46e8045a86f7c4b5d4f0f23".parse().unwrap();
         assert_eq!(tx.fee_in(fee_asset), 56400);
         assert_eq!(tx.all_fees()[&fee_asset], 56400);
@@ -1947,5 +2400,115 @@ mod tests {
             0000\
         ");
         assert!(tx.input[0].previous_output.is_null());
+    }
+
+    #[test]
+    fn superfluous_asset_issuance() {
+        let tx = Vec::<u8>::from_hex("1ae80068000109fee1000000000000000000000000000000000000000000000000000000000000005acf37f60000c7280028a7000000006e000000010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010115190000b9bfb80000000100000000d8d8d8d8d8d8d8d8d8d8d8d8d8d80000000000b8bfb8").unwrap();
+        assert!(matches!(
+            Transaction::consensus_decode(&tx[..]),
+            Err(encode::Error::ParseFailed("superfluous asset issuance")),
+        ));
+    }
+
+    #[test]
+    fn malformed_pegin() {
+        let mut input: TxIn = hex_deserialize!("\
+            0004000000000000ffffffff0000040000c0c0c0c0c0c0c0c0c0000000000000\
+            00805555555555555505c0c0c0c0c03fc0c0c0c0c0c0c0c0c0c0c0c00200ff01\
+            0000000000fd0000000000000000010000000000ffffffffffffffff00000000\
+            000000ff000000000000010000000000000000000001002d342d35313700\
+        ");
+        input.witness = hex_deserialize!("\
+            0000000608202020202020202020202020202020202020202020202020202020\
+            2020202020202020202020202020202020202020202020202020202020202020\
+            2020202020202020202020202020202020202020202020202020202020200000\
+            00000000000000000000000000000002000400000000\
+        ");
+        assert!(input.pegin_data().is_none());
+    }
+
+    #[test]
+    fn discount_vsize() {
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/1in2out_pegin.hex"));
+        assert_eq!(tx.input.len(), 1);
+        assert!(tx.input[0].is_pegin());
+        assert_eq!(tx.output.len(), 2);
+        assert_eq!(tx.weight(), 2403);
+        assert_eq!(tx.vsize(), 601);
+        assert_eq!(tx.discount_weight(), 2403);
+        assert_eq!(tx.discount_vsize(), 601);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/1in2out_tx.hex"));
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.output.len(), 2);
+        assert_eq!(tx.weight(), 5330);
+        assert_eq!(tx.vsize(), 1333);
+        assert_eq!(tx.discount_weight(), 1031);
+        assert_eq!(tx.discount_vsize(), 258);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/1in3out_tx.hex"));
+        assert_eq!(tx.input.len(), 1);
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.weight(), 10107);
+        assert_eq!(tx.vsize(), 2527);
+        assert_eq!(tx.discount_weight(), 1509);
+        assert_eq!(tx.discount_vsize(), 378);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/2in3out_exp.hex"));
+        assert_eq!(tx.input.len(), 2);
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.weight(), 1302);
+        assert_eq!(tx.vsize(), 326);
+        assert_eq!(tx.discount_weight(), 1302);
+        assert_eq!(tx.discount_vsize(), 326);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/2in3out_tx.hex"));
+        assert_eq!(tx.input.len(), 2);
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.weight(), 10300);
+        assert_eq!(tx.vsize(), 2575);
+        assert_eq!(tx.discount_weight(), 1638);
+        assert_eq!(tx.discount_vsize(), 410);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/2in3out_tx2.hex"));
+        assert_eq!(tx.input.len(), 2);
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.weight(), 10536);
+        assert_eq!(tx.vsize(), 2634);
+        assert_eq!(tx.discount_weight(), 1874);
+        assert_eq!(tx.discount_vsize(), 469);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/3in3out_tx.hex"));
+        assert_eq!(tx.input.len(), 3);
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.weight(), 10922);
+        assert_eq!(tx.vsize(), 2731);
+        assert_eq!(tx.discount_weight(), 2196);
+        assert_eq!(tx.discount_vsize(), 549);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/4in3out_tx.hex"));
+        assert_eq!(tx.input.len(), 4);
+        assert_eq!(tx.output.len(), 3);
+        assert_eq!(tx.weight(), 11192);
+        assert_eq!(tx.vsize(), 2798);
+        assert_eq!(tx.discount_weight(), 2466);
+        assert_eq!(tx.discount_vsize(), 617);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/2in4out_tx.hex"));
+        assert_eq!(tx.input.len(), 2);
+        assert_eq!(tx.output.len(), 4);
+        assert_eq!(tx.weight(), 15261);
+        assert_eq!(tx.vsize(), 3816);
+        assert_eq!(tx.discount_weight(), 2268);
+        assert_eq!(tx.discount_vsize(), 567);
+
+        let tx: Transaction = hex_deserialize!(include_str!("../tests/data/2in5out_tx.hex"));
+        assert_eq!(tx.input.len(), 2);
+        assert_eq!(tx.output.len(), 5);
+        assert_eq!(tx.weight(), 20030);
+        assert_eq!(tx.vsize(), 5008);
+        assert_eq!(tx.discount_weight(), 2706);
+        assert_eq!(tx.discount_vsize(), 677);
     }
 }

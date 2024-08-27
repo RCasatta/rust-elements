@@ -12,23 +12,26 @@
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 //
 
-use std::{collections::BTreeMap, io};
 use std::collections::btree_map::Entry;
+use std::{collections::BTreeMap, io};
 
-use {Script, encode, TxOutWitness};
-use bitcoin::util::bip32::KeySource;
-use bitcoin::{self, PublicKey};
-use {pset, confidential};
-use encode::Decodable;
-use pset::map::Map;
-use pset::raw;
-use pset::Error;
+use crate::taproot::TapLeafHash;
+use crate::taproot::{NodeInfo, TaprootBuilder};
+
+use crate::encode::Decodable;
+use crate::pset::map::Map;
+use crate::pset::raw;
+use crate::pset::Error;
+use crate::{confidential, pset};
+use crate::{encode, Script, TxOutWitness};
+use bitcoin::bip32::KeySource;
+use bitcoin::{PublicKey, key::XOnlyPublicKey};
 use secp256k1_zkp::{self, Generator, RangeProof, SurjectionProof};
 
-use issuance;
+use crate::issuance;
 
-use TxOut;
-use AssetId;
+use crate::AssetId;
+use crate::TxOut;
 
 /// Type: Redeem Script PSET_OUT_REDEEM_SCRIPT = 0x00
 const PSET_OUT_REDEEM_SCRIPT: u8 = 0x00;
@@ -40,6 +43,12 @@ const PSET_OUT_BIP32_DERIVATION: u8 = 0x02;
 const PSET_OUT_AMOUNT: u8 = 0x03;
 /// Type: Output Script PSET_OUT_SCRIPT = 0x04
 const PSET_OUT_SCRIPT: u8 = 0x04;
+/// Type: Taproot Internal Key PSBT_OUT_TAP_INTERNAL_KEY = 0x05
+const PSBT_OUT_TAP_INTERNAL_KEY: u8 = 0x05;
+/// Type: Taproot Tree PSBT_OUT_TAP_TREE = 0x06
+const PSBT_OUT_TAP_TREE: u8 = 0x06;
+/// Type: Taproot Key BIP 32 Derivation Path PSBT_OUT_TAP_BIP32_DERIVATION = 0x07
+const PSBT_OUT_TAP_BIP32_DERIVATION: u8 = 0x07;
 /// Type: Proprietary Use Type PSET_IN_PROPRIETARY = 0xFC
 const PSET_OUT_PROPRIETARY: u8 = 0xFC;
 
@@ -73,12 +82,12 @@ const PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF: u8 = 0x09;
 /// PSBT_ELEMENTS_OUT_ASSET_COMMITMENT matches the explicit asset in
 /// PSBT_ELEMENTS_OUT_ASSET. If provided, PSBT_ELEMENTS_OUT_ASSET_COMMITMENT must
 /// be provided too.
-const PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF: u8 = 0x10;
+const PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF: u8 = 0x0a;
 
 /// A key-value map for an output of the corresponding index in the unsigned
 /// transaction.
 #[derive(Clone, Default, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(crate = "actual_serde"))]
 pub struct Output {
     /// The redeem script for this output.
     pub redeem_script: Option<Script>,
@@ -86,8 +95,15 @@ pub struct Output {
     pub witness_script: Option<Script>,
     /// A map from public keys needed to spend this output to their
     /// corresponding master key fingerprints and derivation paths.
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_as_seq"))]
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
     pub bip32_derivation: BTreeMap<PublicKey, KeySource>,
+    /// The internal pubkey
+    pub tap_internal_key: Option<XOnlyPublicKey>,
+    /// Taproot Output tree
+    pub tap_tree: Option<TapTree>,
+    /// Map of tap root x only keys to origin info and leaf hashes contained in it
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
+    pub tap_key_origins: BTreeMap<XOnlyPublicKey, (Vec<TapLeafHash>, KeySource)>,
     /// (PSET) The explicit amount of the output
     pub amount: Option<u64>,
     /// (PSET) The out amount commitment
@@ -100,9 +116,9 @@ pub struct Output {
     pub asset_comm: Option<secp256k1_zkp::Generator>,
     // Proprietary key-value pairs for this output.
     /// Output value rangeproof
-    pub value_rangeproof: Option<RangeProof>,
+    pub value_rangeproof: Option<Box<RangeProof>>,
     /// Output Asset surjection proof
-    pub asset_surjection_proof: Option<SurjectionProof>,
+    pub asset_surjection_proof: Option<Box<SurjectionProof>>,
     /// Blinding pubkey which is used in receiving address
     pub blinding_key: Option<bitcoin::PublicKey>,
     /// The ephermal pk sampled by sender
@@ -110,34 +126,81 @@ pub struct Output {
     /// The index of the input whose owner should blind this output
     pub blinder_index: Option<u32>,
     /// The blind value rangeproof
-    pub blind_value_proof: Option<RangeProof>,
+    pub blind_value_proof: Option<Box<RangeProof>>,
     /// The blind asset surjection proof
-    pub blind_asset_proof: Option<SurjectionProof>,
+    pub blind_asset_proof: Option<Box<SurjectionProof>>,
     /// Pset
     /// Other fields
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_as_seq_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_as_seq_byte_values")
+    )]
     pub proprietary: BTreeMap<raw::ProprietaryKey, Vec<u8>>,
     /// Unknown key-value pairs for this output.
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_as_seq_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_as_seq_byte_values")
+    )]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
 }
 
-impl Output{
+/// Taproot Tree representing a finalized [`TaprootBuilder`] (a complete binary tree)
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(crate = "actual_serde"))]
+pub struct TapTree(pub(crate) TaprootBuilder);
 
+impl PartialEq for TapTree {
+    fn eq(&self, other: &Self) -> bool {
+        self.node_info().hash.eq(&other.node_info().hash)
+    }
+}
+
+impl Eq for TapTree {}
+
+impl TapTree {
+    // get the inner node info as the builder is finalized
+    fn node_info(&self) -> &NodeInfo {
+        // The builder algorithm invariant guarantees that is_complete builder
+        // have only 1 element in branch and that is not None.
+        // We make sure that we only allow is_complete builders via the from_inner
+        // constructor
+        self.0.branch()[0]
+            .as_ref()
+            .expect("from_inner only parses is_complete builders")
+    }
+
+    /// Convert a [`TaprootBuilder`] into a tree if it is complete binary tree.
+    /// Returns the inner as Err if it is not a complete tree
+    pub fn from_inner(inner: TaprootBuilder) -> Result<Self, TaprootBuilder> {
+        if inner.is_complete() {
+            Ok(TapTree(inner))
+        } else {
+            Err(inner)
+        }
+    }
+
+    /// Convert self into builder [`TaprootBuilder`]. The builder is guaranteed to
+    /// be finalized.
+    pub fn into_inner(self) -> TaprootBuilder {
+        self.0
+    }
+}
+
+impl Output {
     /// Create a new explicit pset output
     pub fn new_explicit(
         script: Script,
         amount: u64,
         asset: AssetId,
-        blinding_key: Option<bitcoin::PublicKey>,
+        blinding_key: Option<PublicKey>,
     ) -> Self {
-        let mut res = pset::Output::default();
-        // set the respective values
-        res.script_pubkey = script;
-        res.amount = Some(amount);
-        res.blinding_key = blinding_key;
-        res.asset = Some(asset);
-        res
+        pset::Output {
+            script_pubkey: script,
+            amount: Some(amount),
+            blinding_key,
+            asset: Some(asset),
+            ..Default::default()
+        }
     }
 
     /// Create a output from txout
@@ -149,23 +212,23 @@ impl Output{
     pub fn from_txout(txout: TxOut) -> Self {
         let mut rv = Self::default();
         match txout.value {
-            confidential::Value::Null => { },
+            confidential::Value::Null => {}
             confidential::Value::Explicit(x) => rv.amount = Some(x),
             confidential::Value::Confidential(comm) => rv.amount_comm = Some(comm),
         }
         match txout.asset {
-            confidential::Asset::Null => { },
+            confidential::Asset::Null => {}
             confidential::Asset::Explicit(x) => rv.asset = Some(x),
             confidential::Asset::Confidential(comm) => rv.asset_comm = Some(comm),
         }
         if txout.is_partially_blinded() {
-            rv.ecdh_pubkey = txout.nonce.commitment().map(|pk| bitcoin::PublicKey {
-                key: pk,
+            rv.ecdh_pubkey = txout.nonce.commitment().map(|pk| PublicKey {
+                inner: pk,
                 compressed: true, // always serialize none as compressed pk
             });
         } else {
-            rv.blinding_key = txout.nonce.commitment().map(|pk| bitcoin::PublicKey {
-                key: pk,
+            rv.blinding_key = txout.nonce.commitment().map(|pk| PublicKey {
+                inner: pk,
                 compressed: true, // always serialize none as compressed pk
             });
         }
@@ -189,10 +252,13 @@ impl Output{
                 (None, None) => confidential::Value::Null,
             },
             nonce: if self.is_partially_blinded() {
-                self.ecdh_pubkey.map(|pk| confidential::Nonce::from(pk.key))
+                self.ecdh_pubkey
+                    .map(|pk| confidential::Nonce::from(pk.inner))
             } else {
-                self.blinding_key.map(|pk| confidential::Nonce::from(pk.key))
-            }.unwrap_or_default(),
+                self.blinding_key
+                    .map(|pk| confidential::Nonce::from(pk.inner))
+            }
+            .unwrap_or_default(),
             script_pubkey: self.script_pubkey.clone(),
             witness: TxOutWitness {
                 surjection_proof: self.asset_surjection_proof.clone(),
@@ -209,23 +275,22 @@ impl Output{
 
     /// IsPartiallyBlinded from elements core
     pub fn is_partially_blinded(&self) -> bool {
-        self.is_marked_for_blinding() && (
-            self.amount_comm.is_some() ||
-            self.asset_comm.is_some() ||
-            self.value_rangeproof.is_some() ||
-            self.asset_surjection_proof.is_some() ||
-            self.ecdh_pubkey.is_some()
-        )
+        self.is_marked_for_blinding()
+            && (self.amount_comm.is_some()
+                || self.asset_comm.is_some()
+                || self.value_rangeproof.is_some()
+                || self.asset_surjection_proof.is_some()
+                || self.ecdh_pubkey.is_some())
     }
 
     /// IsFullyBlinded from elements core
     pub fn is_fully_blinded(&self) -> bool {
-        self.is_marked_for_blinding() &&
-        self.amount_comm.is_some() &&
-        self.asset_comm.is_some() &&
-        self.value_rangeproof.is_some() &&
-        self.asset_surjection_proof.is_some() &&
-        self.ecdh_pubkey.is_some()
+        self.is_marked_for_blinding()
+            && self.amount_comm.is_some()
+            && self.asset_comm.is_some()
+            && self.value_rangeproof.is_some()
+            && self.asset_surjection_proof.is_some()
+            && self.ecdh_pubkey.is_some()
     }
 }
 
@@ -259,6 +324,22 @@ impl Map for Output {
             }
             PSET_OUT_SCRIPT => return Err(Error::DuplicateKey(raw_key).into()),
 
+            PSBT_OUT_TAP_INTERNAL_KEY => {
+                impl_pset_insert_pair! {
+                    self.tap_internal_key <= <raw_key: _>|<raw_value: XOnlyPublicKey>
+                }
+            }
+            PSBT_OUT_TAP_TREE => {
+                impl_pset_insert_pair! {
+                    self.tap_tree <= <raw_key: _>|<raw_value: TapTree>
+                }
+            }
+            PSBT_OUT_TAP_BIP32_DERIVATION => {
+                impl_pset_insert_pair! {
+                    self.tap_key_origins <= <raw_key: XOnlyPublicKey>|< raw_value: (Vec<TapLeafHash>, KeySource)>
+                }
+            }
+
             PSET_OUT_PROPRIETARY => {
                 let prop_key = raw::ProprietaryKey::from_key(raw_key.clone())?;
                 if prop_key.is_pset_key() {
@@ -273,45 +354,53 @@ impl Map for Output {
                             impl_pset_prop_insert_pair!(self.asset_comm <= <raw_key: _> | <raw_value : Generator>)
                         }
                         PSBT_ELEMENTS_OUT_VALUE_RANGEPROOF => {
-                            impl_pset_prop_insert_pair!(self.value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.value_rangeproof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
                         }
                         PSBT_ELEMENTS_OUT_ASSET_SURJECTION_PROOF => {
-                            impl_pset_prop_insert_pair!(self.asset_surjection_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
+                            impl_pset_prop_insert_pair!(self.asset_surjection_proof <= <raw_key: _> | <raw_value : Box<SurjectionProof>>)
                         }
                         PSBT_ELEMENTS_OUT_BLINDING_PUBKEY => {
-                            impl_pset_prop_insert_pair!(self.blinding_key <= <raw_key: _> | <raw_value : bitcoin::PublicKey>)
+                            impl_pset_prop_insert_pair!(self.blinding_key <= <raw_key: _> | <raw_value : PublicKey>)
                         }
                         PSBT_ELEMENTS_OUT_ECDH_PUBKEY => {
-                            impl_pset_prop_insert_pair!(self.ecdh_pubkey <= <raw_key: _> | <raw_value : bitcoin::PublicKey>)
+                            impl_pset_prop_insert_pair!(self.ecdh_pubkey <= <raw_key: _> | <raw_value : PublicKey>)
                         }
                         PSBT_ELEMENTS_OUT_BLINDER_INDEX => {
                             impl_pset_prop_insert_pair!(self.blinder_index <= <raw_key: _> | <raw_value : u32>)
                         }
                         PSBT_ELEMENTS_OUT_BLIND_VALUE_PROOF => {
-                            impl_pset_prop_insert_pair!(self.blind_value_proof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.blind_value_proof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
                         }
                         PSBT_ELEMENTS_OUT_BLIND_ASSET_PROOF => {
-                            impl_pset_prop_insert_pair!(self.blind_asset_proof <= <raw_key: _> | <raw_value : SurjectionProof>)
+                            impl_pset_prop_insert_pair!(self.blind_asset_proof <= <raw_key: _> | <raw_value : Box<SurjectionProof>>)
                         }
-                        _ => {
-                            match self.proprietary.entry(prop_key) {
-                                Entry::Vacant(empty_key) => {empty_key.insert(raw_value);},
-                                Entry::Occupied(_) => return Err(Error::DuplicateKey(raw_key.clone()).into()),
+                        _ => match self.proprietary.entry(prop_key) {
+                            Entry::Vacant(empty_key) => {
+                                empty_key.insert(raw_value);
                             }
-                        }
+                            Entry::Occupied(_) => {
+                                return Err(Error::DuplicateKey(raw_key).into())
+                            }
+                        },
                     }
                 } else {
                     match self.proprietary.entry(prop_key) {
-                        Entry::Vacant(empty_key) => {empty_key.insert(raw_value);},
-                        Entry::Occupied(_) => return Err(Error::DuplicateKey(raw_key.clone()).into()),
+                        Entry::Vacant(empty_key) => {
+                            empty_key.insert(raw_value);
+                        }
+                        Entry::Occupied(_) => {
+                            return Err(Error::DuplicateKey(raw_key).into())
+                        }
                     }
                 }
             }
 
             _ => match self.unknown.entry(raw_key) {
-                    Entry::Vacant(empty_key) => {empty_key.insert(raw_value);},
-                    Entry::Occupied(k) => return Err(Error::DuplicateKey(k.key().clone()).into()),
-            }
+                Entry::Vacant(empty_key) => {
+                    empty_key.insert(raw_value);
+                }
+                Entry::Occupied(k) => return Err(Error::DuplicateKey(k.key().clone()).into()),
+            },
         }
 
         Ok(())
@@ -333,6 +422,19 @@ impl Map for Output {
         }
 
         impl_pset_get_pair! {
+            rv.push(self.tap_internal_key as <PSBT_OUT_TAP_INTERNAL_KEY, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_tree as <PSBT_OUT_TAP_TREE, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_key_origins as <PSBT_OUT_TAP_BIP32_DERIVATION,
+                    schnorr::PublicKey>)
+        }
+
+        impl_pset_get_pair! {
             rv.push(self.amount as <PSET_OUT_AMOUNT, _>)
         }
 
@@ -350,8 +452,11 @@ impl Map for Output {
 
         // Mandatory field: Script
         rv.push(raw::Pair {
-            key: raw::Key { type_value: PSET_OUT_SCRIPT, key: vec![]},
-            value: pset::serialize::Serialize::serialize(&self.script_pubkey)
+            key: raw::Key {
+                type_value: PSET_OUT_SCRIPT,
+                key: vec![],
+            },
+            value: pset::serialize::Serialize::serialize(&self.script_pubkey),
         });
 
         // Prop Output fields
@@ -405,9 +510,12 @@ impl Map for Output {
         self.bip32_derivation.extend(other.bip32_derivation);
         self.proprietary.extend(other.proprietary);
         self.unknown.extend(other.unknown);
+        self.tap_key_origins.extend(other.tap_key_origins);
 
         merge!(redeem_script, self, other);
         merge!(witness_script, self, other);
+        merge!(tap_internal_key, self, other);
+        merge!(tap_tree, self, other);
 
         // elements
         merge!(value_rangeproof, self, other);
@@ -426,8 +534,7 @@ impl_psetmap_consensus_encoding!(Output);
 // because some fields like txid and outpoint are
 // not optional and cannot by set by insert_pair
 impl Decodable for Output {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Self, encode::Error> {
-
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
         // Sets the default to [0;32] and [0;4]
         let mut rv = Self::default();
         // let mut out_value: Option<confidential::Value> = None;
@@ -447,10 +554,13 @@ impl Decodable for Output {
                                 out_spk <= <raw_key: _>|<raw_value: Script>
                             }
                         }
-                        _ =>  rv.insert_pair(raw::Pair { key: raw_key, value: raw_value })?,
+                        _ => rv.insert_pair(raw::Pair {
+                            key: raw_key,
+                            value: raw_value,
+                        })?,
                     }
                 }
-                Err(::encode::Error::PsetError(::pset::Error::NoMorePairs)) => break,
+                Err(crate::encode::Error::PsetError(crate::pset::Error::NoMorePairs)) => break,
                 Err(e) => return Err(e),
             }
         }
@@ -460,16 +570,16 @@ impl Decodable for Output {
 
         rv.script_pubkey = spk;
         if let (None, None) = (rv.amount, rv.amount_comm) {
-            return Err(encode::Error::PsetError(Error::MissingOutputValue))
+            return Err(encode::Error::PsetError(Error::MissingOutputValue));
         }
         if let (None, None) = (rv.asset, rv.asset_comm) {
-            return Err(encode::Error::PsetError(Error::MissingOutputAsset))
+            return Err(encode::Error::PsetError(Error::MissingOutputAsset));
         }
         if let (Some(_), None) = (rv.blinding_key, rv.blinder_index) {
-            return Err(encode::Error::PsetError(Error::MissingBlinderIndex))
+            return Err(encode::Error::PsetError(Error::MissingBlinderIndex));
         }
         if rv.is_marked_for_blinding() && rv.is_partially_blinded() && !rv.is_fully_blinded() {
-            return Err(encode::Error::PsetError(Error::MissingBlindingInfo))
+            return Err(encode::Error::PsetError(Error::MissingBlindingInfo));
         }
         Ok(rv)
     }

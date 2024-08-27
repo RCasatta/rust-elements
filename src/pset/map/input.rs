@@ -12,22 +12,31 @@
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 //
 
-use std::{cmp, collections::btree_map::{BTreeMap, Entry}, io};
+use std::fmt;
+use std::{
+    cmp,
+    collections::btree_map::{BTreeMap, Entry},
+    io,
+    str::FromStr,
+};
 
-use {Script, AssetIssuance, SigHashType, Transaction, Txid, TxOut, TxIn, BlockHash};
-use encode::{self, Decodable};
-use confidential;
-use bitcoin::util::bip32::KeySource;
-use bitcoin::{self, PublicKey};
-use hashes::{self, hash160, ripemd160, sha256, sha256d};
-use pset::map::Map;
-use pset::raw;
-use pset::serialize;
-use pset::{self, Error, error};
-use secp256k1_zkp::{self, RangeProof, Tweak, ZERO_TWEAK};
+use crate::taproot::{ControlBlock, LeafVersion, TapNodeHash, TapLeafHash};
+use crate::{schnorr, AssetId, ContractHash};
 
+use crate::{confidential, locktime};
+use crate::encode::{self, Decodable};
+use crate::hashes::{self, hash160, ripemd160, sha256, sha256d, Hash};
+use crate::pset::map::Map;
+use crate::pset::raw;
+use crate::pset::serialize;
+use crate::pset::{self, error, Error};
+use crate::{transaction::SighashTypeParseError, SchnorrSighashType};
+use crate::{AssetIssuance, BlockHash, EcdsaSighashType, Script, Transaction, TxIn, TxOut, Txid};
+use bitcoin::bip32::KeySource;
+use bitcoin::{PublicKey, key::XOnlyPublicKey};
+use secp256k1_zkp::{self, RangeProof, SurjectionProof, Tweak, ZERO_TWEAK};
 
-use OutPoint;
+use crate::{OutPoint, Sequence};
 
 /// Type: Non-Witness UTXO PSET_IN_NON_WITNESS_UTXO = 0x00
 const PSET_IN_NON_WITNESS_UTXO: u8 = 0x00;
@@ -65,6 +74,18 @@ const PSET_IN_SEQUENCE: u8 = 0x10;
 const PSET_IN_REQUIRED_TIME_LOCKTIME: u8 = 0x11;
 /// Type: Required Height-based Locktime PSET_IN_REQUIRED_HEIGHT_LOCKTIME = 0x12
 const PSET_IN_REQUIRED_HEIGHT_LOCKTIME: u8 = 0x12;
+/// Type: Schnorr Signature in Key Spend PSBT_IN_TAP_KEY_SIG = 0x13
+const PSBT_IN_TAP_KEY_SIG: u8 = 0x13;
+/// Type: Schnorr Signature in Script Spend PSBT_IN_TAP_SCRIPT_SIG = 0x14
+const PSBT_IN_TAP_SCRIPT_SIG: u8 = 0x14;
+/// Type: Taproot Leaf Script PSBT_IN_TAP_LEAF_SCRIPT = 0x14
+const PSBT_IN_TAP_LEAF_SCRIPT: u8 = 0x15;
+/// Type: Taproot Key BIP 32 Derivation Path PSBT_IN_TAP_BIP32_DERIVATION = 0x16
+const PSBT_IN_TAP_BIP32_DERIVATION: u8 = 0x16;
+/// Type: Taproot Internal Key PSBT_IN_TAP_INTERNAL_KEY = 0x17
+const PSBT_IN_TAP_INTERNAL_KEY: u8 = 0x17;
+/// Type: Taproot Merkle Root PSBT_IN_TAP_MERKLE_ROOT = 0x18
+const PSBT_IN_TAP_MERKLE_ROOT: u8 = 0x18;
 /// Type: Proprietary Use Type PSET_IN_PROPRIETARY = 0xFC
 const PSET_IN_PROPRIETARY: u8 = 0xFC;
 
@@ -127,10 +148,30 @@ const PSBT_ELEMENTS_IN_ISSUANCE_BLIND_VALUE_PROOF: u8 = 0x0f;
 /// in PSBT_ELEMENTS_IN_ISSUANCE_INFLATION_KEYS. If provided,
 /// PSBT_ELEMENTS_IN_ISSUANCE_INFLATION_KEYS_COMMITMENT must be provided too.
 const PSBT_ELEMENTS_IN_ISSUANCE_BLIND_INFLATION_KEYS_PROOF: u8 = 0x10;
+/// The explicit value for the input being spent. If provided,
+/// PSBT_ELEMENTS_IN_VALUE_PROOF must be provided too.
+const PSBT_ELEMENTS_IN_EXPLICIT_VALUE: u8 = 0x11;
+/// An explicit value rangeproof that proves that the value commitment in this
+/// input's UTXO matches the explicit value in PSBT_ELEMENTS_IN_EXPLICIT_VALUE.
+/// If provided, PSBT_ELEMENTS_IN_EXPLICIT_VALUE must be provided too.
+const PSBT_ELEMENTS_IN_VALUE_PROOF: u8 = 0x12;
+/// The explicit asset for the input being spent. If provided,
+/// PSBT_ELEMENTS_IN_ASSET_PROOF must be provided too.
+const PSBT_ELEMENTS_IN_EXPLICIT_ASSET: u8 = 0x13;
+/// An asset surjection proof with this input's asset as the only asset in the
+/// input set in order to prove that the asset commitment in the UTXO matches
+/// the explicit asset in PSBT_ELEMENTS_IN_EXPLICIT_ASSET. If provided,
+/// PSBT_ELEMENTS_IN_EXPLICIT_ASSET must be provided too.
+const PSBT_ELEMENTS_IN_ASSET_PROOF: u8 = 0x14;
+/// A boolean flag. 0x00 indicates the issuance should not be blinded,
+/// 0x01 indicates it should be. If not specified, assumed to be 0x01.
+/// Note that this does not indicate actual blinding status,
+/// but rather the expected blinding status prior to signing.
+const PSBT_ELEMENTS_IN_BLINDED_ISSUANCE: u8 = 0x15;
 /// A key-value map for an input of the corresponding index in the unsigned
 /// transaction.
-#[derive(Clone, Default, Debug, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(crate = "actual_serde"))]
 pub struct Input {
     /// The non-witness transaction this input spends from. Should only be
     /// [std::option::Option::Some] for inputs which spend non-segwit outputs or
@@ -142,18 +183,21 @@ pub struct Input {
     pub witness_utxo: Option<TxOut>,
     /// A map from public keys to their corresponding signature as would be
     /// pushed to the stack from a scriptSig or witness.
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_byte_values")
+    )]
     pub partial_sigs: BTreeMap<PublicKey, Vec<u8>>,
     /// The sighash type to be used for this input. Signatures for this input
     /// must use the sighash type.
-    pub sighash_type: Option<SigHashType>,
+    pub sighash_type: Option<PsbtSighashType>,
     /// The redeem script for this input.
     pub redeem_script: Option<Script>,
     /// The witness script for this input.
     pub witness_script: Option<Script>,
     /// A map from public keys needed to sign this input to their corresponding
     /// master key fingerprints and derivation paths.
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_as_seq"))]
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
     pub bip32_derivation: BTreeMap<PublicKey, KeySource>,
     /// The finalized, fully-constructed scriptSig with signatures and any other
     /// scripts necessary for this input to pass validation.
@@ -163,36 +207,63 @@ pub struct Input {
     pub final_script_witness: Option<Vec<Vec<u8>>>,
     /// TODO: Proof of reserves commitment
     /// RIPEMD160 hash to preimage map
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_byte_values")
+    )]
     pub ripemd160_preimages: BTreeMap<ripemd160::Hash, Vec<u8>>,
     /// SHA256 hash to preimage map
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_byte_values")
+    )]
     pub sha256_preimages: BTreeMap<sha256::Hash, Vec<u8>>,
     /// HSAH160 hash to preimage map
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_byte_values")
+    )]
     pub hash160_preimages: BTreeMap<hash160::Hash, Vec<u8>>,
     /// HAS256 hash to preimage map
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_byte_values")
+    )]
     pub hash256_preimages: BTreeMap<sha256d::Hash, Vec<u8>>,
     /// (PSET) Prevout TXID of the input
     pub previous_txid: Txid,
     /// (PSET) Prevout vout of the input
     pub previous_output_index: u32,
     /// (PSET) Sequence number. If omitted, defaults to 0xffffffff
-    pub sequence: Option<u32>,
+    pub sequence: Option<Sequence>,
     /// (PSET) Minimum required locktime, as a UNIX timestamp. If present, must be greater than or equal to 500000000
-    pub required_time_locktime: Option<u32>,
+    pub required_time_locktime: Option<locktime::Time>,
     /// (PSET) Minimum required locktime, as a blockheight. If present, must be less than 500000000
-    pub required_height_locktime: Option<u32>,
+    pub required_height_locktime: Option<locktime::Height>,
+    /// Serialized schnorr signature with sighash type for key spend
+    pub tap_key_sig: Option<schnorr::SchnorrSig>,
+    /// Map of `<xonlypubkey>|<leafhash>` with signature
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
+    pub tap_script_sigs: BTreeMap<(XOnlyPublicKey, TapLeafHash), schnorr::SchnorrSig>,
+    /// Map of Control blocks to Script version pair
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
+    pub tap_scripts: BTreeMap<ControlBlock, (Script, LeafVersion)>,
+    /// Map of tap root x only keys to origin info and leaf hashes contained in it
+    #[cfg_attr(feature = "serde", serde(with = "crate::serde_utils::btreemap_as_seq"))]
+    pub tap_key_origins: BTreeMap<XOnlyPublicKey, (Vec<TapLeafHash>, KeySource)>,
+    /// Taproot Internal key
+    pub tap_internal_key: Option<XOnlyPublicKey>,
+    /// Taproot Merkle root
+    pub tap_merkle_root: Option<TapNodeHash>,
     // Proprietary key-value pairs for this input.
     /// The issuance value
     pub issuance_value_amount: Option<u64>,
     /// The issuance value commitment
     pub issuance_value_comm: Option<secp256k1_zkp::PedersenCommitment>,
     /// Issuance value rangeproof
-    pub issuance_value_rangeproof: Option<RangeProof>,
+    pub issuance_value_rangeproof: Option<Box<RangeProof>>,
     /// Issuance keys rangeproof
-    pub issuance_keys_rangeproof: Option<RangeProof>,
+    pub issuance_keys_rangeproof: Option<Box<RangeProof>>,
     /// Pegin Transaction. Should be a bitcoin::Transaction
     pub pegin_tx: Option<bitcoin::Transaction>,
     /// Pegin Transaction proof
@@ -215,33 +286,178 @@ pub struct Input {
     /// Issuance asset entropy
     pub issuance_asset_entropy: Option<[u8; 32]>,
     /// input utxo rangeproof
-    pub in_utxo_rangeproof: Option<RangeProof>,
+    pub in_utxo_rangeproof: Option<Box<RangeProof>>,
     /// Proof that blinded issuance matches the commitment
-    pub in_issuance_blind_value_proof: Option<RangeProof>,
+    pub in_issuance_blind_value_proof: Option<Box<RangeProof>>,
     /// Proof that blinded inflation keys matches the corresponding commitment
-    pub in_issuance_blind_inflation_keys_proof: Option<RangeProof>,
+    pub in_issuance_blind_inflation_keys_proof: Option<Box<RangeProof>>,
+    /// The explicit amount of the input
+    pub amount: Option<u64>,
+    /// The blind value rangeproof
+    pub blind_value_proof: Option<Box<RangeProof>>,
+    /// The input explicit asset
+    pub asset: Option<AssetId>,
+    /// The blind asset surjection proof
+    pub blind_asset_proof: Option<Box<SurjectionProof>>,
+    /// Whether the issuance is blinded
+    pub blinded_issuance: Option<u8>,
     /// Other fields
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_as_seq_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_as_seq_byte_values")
+    )]
     pub proprietary: BTreeMap<raw::ProprietaryKey, Vec<u8>>,
     /// Unknown key-value pairs for this input.
-    #[cfg_attr(feature = "serde", serde(with = "::serde_utils::btreemap_as_seq_byte_values"))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(with = "crate::serde_utils::btreemap_as_seq_byte_values")
+    )]
     pub unknown: BTreeMap<raw::Key, Vec<u8>>,
 }
 
-impl Input{
+impl Default for Input {
+    fn default() -> Self {
+        Self { non_witness_utxo: Default::default(), witness_utxo: Default::default(), partial_sigs: Default::default(), sighash_type: Default::default(), redeem_script: Default::default(), witness_script: Default::default(), bip32_derivation: Default::default(), final_script_sig: Default::default(), final_script_witness: Default::default(), ripemd160_preimages: Default::default(), sha256_preimages: Default::default(), hash160_preimages: Default::default(), hash256_preimages: Default::default(), previous_txid: Txid::all_zeros(), previous_output_index: Default::default(), sequence: Default::default(), required_time_locktime: Default::default(), required_height_locktime: Default::default(), tap_key_sig: Default::default(), tap_script_sigs: Default::default(), tap_scripts: Default::default(), tap_key_origins: Default::default(), tap_internal_key: Default::default(), tap_merkle_root: Default::default(), issuance_value_amount: Default::default(), issuance_value_comm: Default::default(), issuance_value_rangeproof: Default::default(), issuance_keys_rangeproof: Default::default(), pegin_tx: Default::default(), pegin_txout_proof: Default::default(), pegin_genesis_hash: Default::default(), pegin_claim_script: Default::default(), pegin_value: Default::default(), pegin_witness: Default::default(), issuance_inflation_keys: Default::default(), issuance_inflation_keys_comm: Default::default(), issuance_blinding_nonce: Default::default(), issuance_asset_entropy: Default::default(), in_utxo_rangeproof: Default::default(), in_issuance_blind_value_proof: Default::default(), in_issuance_blind_inflation_keys_proof: Default::default(), amount: Default::default(), blind_value_proof: Default::default(), asset: Default::default(), blind_asset_proof: Default::default(), blinded_issuance: Default::default(), proprietary: Default::default(), unknown: Default::default() }
+    }
+}
+
+/// A Signature hash type for the corresponding input. As of taproot upgrade, the signature hash
+/// type can be either [`EcdsaSighashType`] or [`SchnorrSighashType`] but it is not possible to know
+/// directly which signature hash type the user is dealing with. Therefore, the user is responsible
+/// for converting to/from [`PsbtSighashType`] from/to the desired signature hash type they need.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PsbtSighashType {
+    pub(crate) inner: u32,
+}
+
+serde_string_impl!(PsbtSighashType, "a PsbtSighashType data");
+
+impl fmt::Display for PsbtSighashType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.schnorr_hash_ty() {
+            Some(SchnorrSighashType::Reserved) | None => write!(f, "{:#x}", self.inner),
+            Some(schnorr_hash_ty) => fmt::Display::fmt(&schnorr_hash_ty, f),
+        }
+    }
+}
+
+impl FromStr for PsbtSighashType {
+    type Err = SighashTypeParseError;
+
+    #[inline]
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // We accept strings of form: "SIGHASH_ALL" etc.
+        //
+        // NB: some of Schnorr sighash types are non-standard for pre-taproot
+        // inputs. We also do not support SIGHASH_RESERVED in verbatim form
+        // ("0xFF" string should be used instead).
+        match SchnorrSighashType::from_str(s) {
+            Ok(SchnorrSighashType::Reserved) => {
+                return Err(SighashTypeParseError {
+                    unrecognized: s.to_owned(),
+                })
+            }
+            Ok(ty) => return Ok(ty.into()),
+            Err(_) => {}
+        }
+
+        // We accept non-standard sighash values.
+        if let Ok(inner) = u32::from_str_radix(s.trim_start_matches("0x"), 16) {
+            return Ok(PsbtSighashType { inner });
+        }
+
+        Err(SighashTypeParseError {
+            unrecognized: s.to_owned(),
+        })
+    }
+}
+impl From<EcdsaSighashType> for PsbtSighashType {
+    fn from(ecdsa_hash_ty: EcdsaSighashType) -> Self {
+        PsbtSighashType {
+            inner: ecdsa_hash_ty as u32,
+        }
+    }
+}
+
+impl From<SchnorrSighashType> for PsbtSighashType {
+    fn from(schnorr_hash_ty: SchnorrSighashType) -> Self {
+        PsbtSighashType {
+            inner: schnorr_hash_ty as u32,
+        }
+    }
+}
+
+impl PsbtSighashType {
+    /// Returns the [`EcdsaSighashType`] if the [`PsbtSighashType`] can be
+    /// converted to one.
+    pub fn ecdsa_hash_ty(self) -> Option<EcdsaSighashType> {
+        EcdsaSighashType::from_standard(self.inner).ok()
+    }
+
+    /// Returns the [`SchnorrSighashType`] if the [`PsbtSighashType`] can be
+    /// converted to one.
+    pub fn schnorr_hash_ty(self) -> Option<SchnorrSighashType> {
+        if self.inner > 0xffu32 {
+            None
+        } else {
+            SchnorrSighashType::from_u8(self.inner as u8)
+        }
+    }
+
+    /// Creates a [`PsbtSighashType`] from a raw `u32`.
+    ///
+    /// Allows construction of a non-standard or non-valid sighash flag.
+    pub fn from_u32(n: u32) -> PsbtSighashType {
+        PsbtSighashType { inner: n }
+    }
+
+    /// Converts [`PsbtSighashType`] to a raw `u32` sighash flag.
+    ///
+    /// No guarantees are made as to the standardness or validity of the returned value.
+    pub fn to_u32(self) -> u32 {
+        self.inner
+    }
+}
+
+impl Input {
+    /// Obtains the [`EcdsaSighashType`] for this input if one is specified. If no sighash type is
+    /// specified, returns [`EcdsaSighashType::All`].
+    ///
+    /// # Errors
+    ///
+    /// If the `sighash_type` field is set to a non-standard ECDSA sighash value.
+    pub fn ecdsa_hash_ty(&self) -> Option<EcdsaSighashType> {
+        self.sighash_type
+            .map(|sighash_type| sighash_type.ecdsa_hash_ty())
+            .unwrap_or(Some(EcdsaSighashType::All))
+    }
+
+    /// Obtains the [`SchnorrSighashType`] for this input if one is specified. If no sighash type is
+    /// specified, returns [`SchnorrSighashType::Default`].
+    ///
+    /// # Errors
+    ///
+    /// If the `sighash_type` field is set to a invalid Schnorr sighash value.
+    pub fn schnorr_hash_ty(&self) -> Option<SchnorrSighashType> {
+        self.sighash_type
+            .map(|sighash_type| sighash_type.schnorr_hash_ty())
+            .unwrap_or(Some(SchnorrSighashType::Default))
+    }
 
     /// Create a psbt input from prevout
     /// without any issuance or pegins
     pub fn from_prevout(outpoint: OutPoint) -> Self {
-        let mut ret = Self::default();
-        ret.previous_output_index = outpoint.vout;
-        ret.previous_txid = outpoint.txid;
-        ret
+        Input {
+            previous_output_index: outpoint.vout,
+            previous_txid: outpoint.txid,
+            ..Default::default()
+        }
     }
 
     /// Create a pset input from TxIn
     pub fn from_txin(txin: TxIn) -> Self {
         let mut ret = Self::from_prevout(txin.previous_output);
+        let has_issuance = txin.has_issuance();
         ret.sequence = Some(txin.sequence);
         ret.final_script_sig = Some(txin.script_sig);
         ret.final_script_witness = Some(txin.witness.script_witness);
@@ -250,20 +466,21 @@ impl Input{
             ret.previous_output_index |= 1 << 30;
             ret.pegin_witness = Some(txin.witness.pegin_witness);
         }
-        if txin.has_issuance {
+        if has_issuance {
             ret.previous_output_index |= 1 << 31;
             ret.issuance_blinding_nonce = Some(txin.asset_issuance.asset_blinding_nonce);
             ret.issuance_asset_entropy = Some(txin.asset_issuance.asset_entropy);
             match txin.asset_issuance.amount {
-                confidential::Value::Null => { },
+                confidential::Value::Null => {}
                 confidential::Value::Explicit(x) => ret.issuance_value_amount = Some(x),
                 confidential::Value::Confidential(comm) => ret.issuance_value_comm = Some(comm),
             }
             match txin.asset_issuance.inflation_keys {
-                confidential::Value::Null => { },
+                confidential::Value::Null => {}
                 confidential::Value::Explicit(x) => ret.issuance_inflation_keys = Some(x),
-                confidential::Value::Confidential(comm) =>
-                    ret.issuance_inflation_keys_comm = Some(comm),
+                confidential::Value::Confidential(comm) => {
+                    ret.issuance_inflation_keys_comm = Some(comm)
+                }
             }
 
             // Witness
@@ -273,9 +490,33 @@ impl Input{
         ret
     }
 
+    /// Compute the issuance asset ids from pset. This function does not check
+    /// whether there is an issuance in this input. Returns (asset_id, token_id)
+    pub fn issuance_ids(&self) -> (AssetId, AssetId) {
+        let issue_nonce = self.issuance_blinding_nonce.unwrap_or(ZERO_TWEAK);
+        let entropy = if issue_nonce == ZERO_TWEAK {
+            // new issuance
+            let prevout = OutPoint {
+                txid: self.previous_txid,
+                vout: self.previous_output_index,
+            };
+            let contract_hash =
+                ContractHash::from_byte_array(self.issuance_asset_entropy.unwrap_or_default());
+            AssetId::generate_asset_entropy(prevout, contract_hash)
+        } else {
+            // re-issuance
+            sha256::Midstate::from_byte_array(self.issuance_asset_entropy.unwrap_or_default())
+        };
+        let asset_id = AssetId::from_entropy(entropy);
+        let token_id =
+            AssetId::reissuance_token_from_entropy(entropy, self.issuance_value_comm.is_some());
+
+        (asset_id, token_id)
+    }
+
     /// If the pset input has issuance
     pub fn has_issuance(&self) -> bool {
-        self.previous_output_index & (1 << 31) != 0
+        !self.asset_issuance().is_null()
     }
 
     /// If the Pset Input is pegin
@@ -286,15 +527,17 @@ impl Input{
     /// Get the issuance for this tx input
     pub fn asset_issuance(&self) -> AssetIssuance {
         AssetIssuance {
-            asset_blinding_nonce: *self.issuance_blinding_nonce.as_ref()
-                .unwrap_or(&ZERO_TWEAK),
+            asset_blinding_nonce: *self.issuance_blinding_nonce.as_ref().unwrap_or(&ZERO_TWEAK),
             asset_entropy: self.issuance_asset_entropy.unwrap_or_default(),
             amount: match (self.issuance_value_amount, self.issuance_value_comm) {
                 (None, None) => confidential::Value::Null,
                 (_, Some(comm)) => confidential::Value::Confidential(comm),
                 (Some(x), None) => confidential::Value::Explicit(x),
             },
-            inflation_keys: match (self.issuance_inflation_keys, self.issuance_inflation_keys_comm) {
+            inflation_keys: match (
+                self.issuance_inflation_keys,
+                self.issuance_inflation_keys_comm,
+            ) {
                 (None, None) => confidential::Value::Null,
                 (_, Some(comm)) => confidential::Value::Confidential(comm),
                 (Some(x), None) => confidential::Value::Explicit(x),
@@ -328,7 +571,7 @@ impl Map for Input {
             }
             PSET_IN_SIGHASH_TYPE => {
                 impl_pset_insert_pair! {
-                    self.sighash_type <= <raw_key: _>|<raw_value: SigHashType>
+                    self.sighash_type <= <raw_key: _>|<raw_value: PsbtSighashType>
                 }
             }
             PSET_IN_REDEEM_SCRIPT => {
@@ -357,33 +600,83 @@ impl Map for Input {
                 }
             }
             PSET_IN_RIPEMD160 => {
-                pset_insert_hash_pair(&mut self.ripemd160_preimages, raw_key, raw_value, error::PsetHash::Ripemd)?;
+                pset_insert_hash_pair(
+                    &mut self.ripemd160_preimages,
+                    raw_key,
+                    raw_value,
+                    error::PsetHash::Ripemd,
+                )?;
             }
             PSET_IN_SHA256 => {
-                pset_insert_hash_pair(&mut self.sha256_preimages, raw_key, raw_value, error::PsetHash::Sha256)?;
+                pset_insert_hash_pair(
+                    &mut self.sha256_preimages,
+                    raw_key,
+                    raw_value,
+                    error::PsetHash::Sha256,
+                )?;
             }
             PSET_IN_HASH160 => {
-                pset_insert_hash_pair(&mut self.hash160_preimages, raw_key, raw_value, error::PsetHash::Hash160)?;
+                pset_insert_hash_pair(
+                    &mut self.hash160_preimages,
+                    raw_key,
+                    raw_value,
+                    error::PsetHash::Hash160,
+                )?;
             }
             PSET_IN_HASH256 => {
-                pset_insert_hash_pair(&mut self.hash256_preimages, raw_key, raw_value, error::PsetHash::Hash256)?;
+                pset_insert_hash_pair(
+                    &mut self.hash256_preimages,
+                    raw_key,
+                    raw_value,
+                    error::PsetHash::Hash256,
+                )?;
             }
-            PSET_IN_PREVIOUS_TXID| PSET_IN_OUTPUT_INDEX => {
+            PSET_IN_PREVIOUS_TXID | PSET_IN_OUTPUT_INDEX => {
                 return Err(Error::DuplicateKey(raw_key))?;
             }
             PSET_IN_SEQUENCE => {
                 impl_pset_insert_pair! {
-                    self.sequence <= <raw_key: _>|<raw_value: u32>
+                    self.sequence <= <raw_key: _>|<raw_value: Sequence>
                 }
             }
             PSET_IN_REQUIRED_TIME_LOCKTIME => {
                 impl_pset_insert_pair! {
-                    self.required_time_locktime <= <raw_key: _>|<raw_value: u32>
+                    self.required_time_locktime <= <raw_key: _>|<raw_value: locktime::Time>
                 }
             }
             PSET_IN_REQUIRED_HEIGHT_LOCKTIME => {
                 impl_pset_insert_pair! {
-                    self.required_height_locktime <= <raw_key: _>|<raw_value: u32>
+                    self.required_height_locktime <= <raw_key: _>|<raw_value: locktime::Height>
+                }
+            }
+            PSBT_IN_TAP_KEY_SIG => {
+                impl_pset_insert_pair! {
+                    self.tap_key_sig <= <raw_key: _>|<raw_value: schnorr::SchnorrSig>
+                }
+            }
+            PSBT_IN_TAP_SCRIPT_SIG => {
+                impl_pset_insert_pair! {
+                    self.tap_script_sigs <= <raw_key: (XOnlyPublicKey, TapLeafHash)>|<raw_value: schnorr::SchnorrSig>
+                }
+            }
+            PSBT_IN_TAP_LEAF_SCRIPT => {
+                impl_pset_insert_pair! {
+                    self.tap_scripts <= <raw_key: ControlBlock>|< raw_value: (Script, LeafVersion)>
+                }
+            }
+            PSBT_IN_TAP_BIP32_DERIVATION => {
+                impl_pset_insert_pair! {
+                    self.tap_key_origins <= <raw_key: XOnlyPublicKey>|< raw_value: (Vec<TapLeafHash>, KeySource)>
+                }
+            }
+            PSBT_IN_TAP_INTERNAL_KEY => {
+                impl_pset_insert_pair! {
+                    self.tap_internal_key <= <raw_key: _>|< raw_value: XOnlyPublicKey>
+                }
+            }
+            PSBT_IN_TAP_MERKLE_ROOT => {
+                impl_pset_insert_pair! {
+                    self.tap_merkle_root <= <raw_key: _>|< raw_value: TapNodeHash>
                 }
             }
             PSET_IN_PROPRIETARY => {
@@ -397,10 +690,10 @@ impl Map for Input {
                             impl_pset_prop_insert_pair!(self.issuance_value_comm <= <raw_key: _> | <raw_value : secp256k1_zkp::PedersenCommitment>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_VALUE_RANGEPROOF => {
-                            impl_pset_prop_insert_pair!(self.issuance_value_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.issuance_value_rangeproof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_KEYS_RANGEPROOF => {
-                            impl_pset_prop_insert_pair!(self.issuance_keys_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.issuance_keys_rangeproof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
                         }
                         PSBT_ELEMENTS_IN_PEG_IN_TX => {
                             impl_pset_prop_insert_pair!(self.pegin_tx <= <raw_key: _> | <raw_value : bitcoin::Transaction>)
@@ -434,20 +727,35 @@ impl Map for Input {
                             impl_pset_prop_insert_pair!(self.issuance_asset_entropy <= <raw_key: _> | <raw_value : [u8;32]>)
                         }
                         PSBT_ELEMENTS_IN_UTXO_RANGEPROOF => {
-                            impl_pset_prop_insert_pair!(self.in_utxo_rangeproof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.in_utxo_rangeproof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_BLIND_VALUE_PROOF => {
-                            impl_pset_prop_insert_pair!(self.in_issuance_blind_value_proof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.in_issuance_blind_value_proof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
                         }
                         PSBT_ELEMENTS_IN_ISSUANCE_BLIND_INFLATION_KEYS_PROOF => {
-                            impl_pset_prop_insert_pair!(self.in_issuance_blind_inflation_keys_proof <= <raw_key: _> | <raw_value : RangeProof>)
+                            impl_pset_prop_insert_pair!(self.in_issuance_blind_inflation_keys_proof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
+                        }
+                        PSBT_ELEMENTS_IN_EXPLICIT_VALUE => {
+                            impl_pset_prop_insert_pair!(self.amount <= <raw_key: _> | <raw_value : u64>)
+                        }
+                        PSBT_ELEMENTS_IN_VALUE_PROOF => {
+                            impl_pset_prop_insert_pair!(self.blind_value_proof <= <raw_key: _> | <raw_value : Box<RangeProof>>)
+                        }
+                        PSBT_ELEMENTS_IN_EXPLICIT_ASSET => {
+                            impl_pset_prop_insert_pair!(self.asset <= <raw_key: _> | <raw_value : AssetId>)
+                        }
+                        PSBT_ELEMENTS_IN_ASSET_PROOF => {
+                            impl_pset_prop_insert_pair!(self.blind_asset_proof <= <raw_key: _> | <raw_value : Box<SurjectionProof>>)
+                        }
+                        PSBT_ELEMENTS_IN_BLINDED_ISSUANCE => {
+                            impl_pset_prop_insert_pair!(self.blinded_issuance <= <raw_key: _> | <raw_value : u8>)
                         }
                         _ => match self.proprietary.entry(prop_key) {
-                                Entry::Vacant(empty_key) => {
-                                    empty_key.insert(raw_value);
-                                }
-                                Entry::Occupied(_) => return Err(Error::DuplicateKey(raw_key).into()),
-                        }
+                            Entry::Vacant(empty_key) => {
+                                empty_key.insert(raw_value);
+                            }
+                            Entry::Occupied(_) => return Err(Error::DuplicateKey(raw_key).into()),
+                        },
                     }
                 }
             }
@@ -455,9 +763,7 @@ impl Map for Input {
                 Entry::Vacant(empty_key) => {
                     empty_key.insert(raw_value);
                 }
-                Entry::Occupied(k) => {
-                    return Err(Error::DuplicateKey(k.key().clone()).into())
-                }
+                Entry::Occupied(k) => return Err(Error::DuplicateKey(k.key().clone()).into()),
             },
         }
 
@@ -521,14 +827,20 @@ impl Map for Input {
 
         // Mandatory field: Prev Txid
         rv.push(raw::Pair {
-            key: raw::Key { type_value: PSET_IN_PREVIOUS_TXID, key: vec![]},
-            value: serialize::Serialize::serialize(&self.previous_txid)
+            key: raw::Key {
+                type_value: PSET_IN_PREVIOUS_TXID,
+                key: vec![],
+            },
+            value: serialize::Serialize::serialize(&self.previous_txid),
         });
 
         // Mandatory field: prev out index
         rv.push(raw::Pair {
-            key: raw::Key { type_value: PSET_IN_OUTPUT_INDEX, key: vec![]},
-            value: serialize::Serialize::serialize(&self.previous_output_index)
+            key: raw::Key {
+                type_value: PSET_IN_OUTPUT_INDEX,
+                key: vec![],
+            },
+            value: serialize::Serialize::serialize(&self.previous_output_index),
         });
 
         impl_pset_get_pair! {
@@ -541,6 +853,31 @@ impl Map for Input {
 
         impl_pset_get_pair! {
             rv.push(self.required_height_locktime as <PSET_IN_REQUIRED_HEIGHT_LOCKTIME, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_key_sig as <PSBT_IN_TAP_KEY_SIG, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_script_sigs as <PSBT_IN_TAP_SCRIPT_SIG, (schnorr::PublicKey, TapLeafHash)>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_scripts as <PSBT_IN_TAP_LEAF_SCRIPT, ControlBlock>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_key_origins as <PSBT_IN_TAP_BIP32_DERIVATION,
+                schnorr::PublicKey>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_internal_key as <PSBT_IN_TAP_INTERNAL_KEY, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push(self.tap_merkle_root as <PSBT_IN_TAP_MERKLE_ROOT, _>)
         }
 
         impl_pset_get_pair! {
@@ -611,6 +948,26 @@ impl Map for Input {
             rv.push_prop(self.in_issuance_blind_inflation_keys_proof as <PSBT_ELEMENTS_IN_ISSUANCE_BLIND_INFLATION_KEYS_PROOF, _>)
         }
 
+        impl_pset_get_pair! {
+            rv.push_prop(self.amount as <PSBT_ELEMENTS_IN_EXPLICIT_VALUE, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push_prop(self.blind_value_proof as <PSBT_ELEMENTS_IN_VALUE_PROOF, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push_prop(self.asset as <PSBT_ELEMENTS_IN_EXPLICIT_ASSET, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push_prop(self.blind_asset_proof as <PSBT_ELEMENTS_IN_ASSET_PROOF, _>)
+        }
+
+        impl_pset_get_pair! {
+            rv.push_prop(self.blinded_issuance as <PSBT_ELEMENTS_IN_BLINDED_ISSUANCE, _>)
+        }
+
         for (key, value) in self.proprietary.iter() {
             rv.push(raw::Pair {
                 key: key.to_key(),
@@ -645,6 +1002,9 @@ impl Map for Input {
         self.sha256_preimages.extend(other.sha256_preimages);
         self.hash160_preimages.extend(other.hash160_preimages);
         self.hash256_preimages.extend(other.hash256_preimages);
+        self.tap_script_sigs.extend(other.tap_script_sigs);
+        self.tap_scripts.extend(other.tap_scripts);
+        self.tap_key_origins.extend(other.tap_key_origins);
         self.proprietary.extend(other.proprietary);
         self.unknown.extend(other.unknown);
 
@@ -652,10 +1012,17 @@ impl Map for Input {
         merge!(witness_script, self, other);
         merge!(final_script_sig, self, other);
         merge!(final_script_witness, self, other);
+        merge!(tap_key_sig, self, other);
+        merge!(tap_internal_key, self, other);
+        merge!(tap_merkle_root, self, other);
 
         // Should we do this?
-        self.required_time_locktime = cmp::max(self.required_time_locktime, other.required_time_locktime);
-        self.required_height_locktime = cmp::max(self.required_height_locktime, other.required_height_locktime);
+        self.required_time_locktime =
+            cmp::max(self.required_time_locktime, other.required_time_locktime);
+        self.required_height_locktime = cmp::max(
+            self.required_height_locktime,
+            other.required_height_locktime,
+        );
 
         // elements
         merge!(issuance_value_amount, self, other);
@@ -675,6 +1042,11 @@ impl Map for Input {
         merge!(in_utxo_rangeproof, self, other);
         merge!(in_issuance_blind_value_proof, self, other);
         merge!(in_issuance_blind_inflation_keys_proof, self, other);
+        merge!(amount, self, other);
+        merge!(blind_value_proof, self, other);
+        merge!(asset, self, other);
+        merge!(blind_asset_proof, self, other);
+        merge!(blinded_issuance, self, other);
         Ok(())
     }
 }
@@ -685,8 +1057,7 @@ impl_psetmap_consensus_encoding!(Input);
 // because some fields like txid and outpoint are
 // not optional and cannot by set by insert_pair
 impl Decodable for Input {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Self, encode::Error> {
-
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
         // Sets the default to [0;32] and [0;4]
         let mut rv = Self::default();
         let mut prev_vout: Option<u32> = None;
@@ -710,10 +1081,13 @@ impl Decodable for Input {
                                 prev_vout <= <raw_key: _>|<raw_value: u32>
                             }
                         }
-                        _ =>  rv.insert_pair(raw::Pair { key: raw_key, value: raw_value })?,
+                        _ => rv.insert_pair(raw::Pair {
+                            key: raw_key,
+                            value: raw_value,
+                        })?,
                     }
                 }
-                Err(::encode::Error::PsetError(::pset::Error::NoMorePairs)) => break,
+                Err(crate::encode::Error::PsetError(crate::pset::Error::NoMorePairs)) => break,
                 Err(e) => return Err(e),
             }
         }
@@ -751,13 +1125,13 @@ where
                 return Err(pset::Error::InvalidPreimageHashPair {
                     preimage: val,
                     hash: Vec::from(key_val.borrow()),
-                    hash_type: hash_type,
+                    hash_type,
                 }
                 .into());
             }
             empty_key.insert(val);
             Ok(())
         }
-        Entry::Occupied(_) => return Err(pset::Error::DuplicateKey(raw_key).into()),
+        Entry::Occupied(_) => Err(pset::Error::DuplicateKey(raw_key).into()),
     }
 }

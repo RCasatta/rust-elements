@@ -3,6 +3,7 @@ name = "elements-fuzz"
 version = "0.0.1"
 authors = ["Automatically generated"]
 publish = false
+edition = "2018"
 
 [package.metadata]
 cargo-fuzz = true
@@ -12,9 +13,9 @@ afl_fuzz = ["afl"]
 honggfuzz_fuzz = ["honggfuzz"]
 
 [dependencies]
-honggfuzz = { version = "0.5", optional = true }
+honggfuzz = { version = "0.5", optional = true, default-features = false }
 afl = { version = "0.11", optional = true }
-elements = { path = "..", features = ["fuzztarget", "serde-feature"] }
+elements = { path = "..", features = ["serde"] }
 
 # Prevent this from interfering with workspaces
 [workspace]

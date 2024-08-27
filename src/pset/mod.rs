@@ -15,11 +15,12 @@
 //! # Partially Signed Elements Transactions (PSET)
 //!
 //! Implementation of BIP174 Partially Signed Bitcoin Transaction Format as
-//! defined at https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
-//! except we define PSETs containing non-standard SigHash types as invalid.
+//! defined at <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki>
+//! except we define PSETs containing non-standard Sighash types as invalid.
 //! Extension for PSET is based on PSET defined in BIP370.
-//! https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki
+//! <https://github.com/bitcoin/bips/blob/master/bip-0174.mediawiki>
 
+use std::collections::HashMap;
 use std::{cmp, io};
 
 mod error;
@@ -28,26 +29,34 @@ mod macros;
 mod map;
 pub mod raw;
 pub mod serialize;
+pub mod elip100;
+pub mod elip101;
 
-use {Transaction, Txid, TxIn, OutPoint, TxInWitness, TxOut, TxOutWitness};
-use encode::{self, Encodable, Decodable};
-use confidential;
+#[cfg(feature = "base64")]
+mod str;
+
+#[cfg(feature = "base64")]
+pub use self::str::ParseError;
+
+use crate::blind::{BlindAssetProofs, BlindValueProofs};
+use crate::confidential;
+use crate::encode::{self, Decodable, Encodable};
+use crate::{
+    blind::RangeProofMessage,
+    confidential::{AssetBlindingFactor, ValueBlindingFactor},
+    TxOutSecrets,
+};
+use crate::{OutPoint, LockTime, Sequence, SurjectionInput, Transaction, TxIn, TxInWitness, TxOut, TxOutWitness, Txid};
 use secp256k1_zkp::rand::{CryptoRng, RngCore};
-use secp256k1_zkp::{self, RangeProof, SurjectionProof};
-use {TxOutSecrets, blind::RangeProofMessage, confidential::{AssetBlindingFactor, ValueBlindingFactor}};
-use bitcoin;
-
-use blind::ConfidentialTxOutError;
-
-use blind::{BlindAssetProofs, BlindValueProofs};
+use secp256k1_zkp::{self, RangeProof, SecretKey, SurjectionProof};
 
 pub use self::error::{Error, PsetBlindError};
-pub use self::map::{Global, GlobalTxData, Input, Output};
 use self::map::Map;
+pub use self::map::{Global, GlobalTxData, Input, Output, PsbtSighashType, TapTree};
 
 /// A Partially Signed Transaction.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize), serde(crate = "actual_serde"))]
 pub struct PartiallySignedTransaction {
     /// The key-value pairs for all global data.
     pub global: Global,
@@ -59,25 +68,33 @@ pub struct PartiallySignedTransaction {
     outputs: Vec<Output>,
 }
 
-impl PartiallySignedTransaction {
+impl Default for PartiallySignedTransaction {
+    fn default() -> Self {
+        Self::new_v2()
+    }
+}
 
+impl PartiallySignedTransaction {
     /// Create a new PSET from a raw transaction
     pub fn from_tx(tx: Transaction) -> Self {
-        let mut global = Global::default();
-        global.tx_data.output_count = tx.output.len();
-        global.tx_data.input_count = tx.input.len();
-        global.tx_data.fallback_locktime = Some(tx.lock_time);
-        global.tx_data.version = tx.version;
+        let global = Global {
+            tx_data: GlobalTxData {
+                output_count: tx.output.len(),
+                input_count: tx.input.len(),
+                fallback_locktime: Some(tx.lock_time),
+                version: tx.version,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
 
         let inputs = tx.input.into_iter().map(Input::from_txin).collect();
-        let outputs = tx.output.into_iter().map(|o| {
-            Output::from_txout(o)
-        }).collect();
-        Self {
-            global: global,
-            inputs: inputs,
-            outputs: outputs,
-        }
+        let outputs = tx
+            .output
+            .into_iter()
+            .map(Output::from_txout)
+            .collect();
+        Self { global, inputs, outputs }
     }
     /// Create a PartiallySignedTransaction with zero inputs
     /// zero outputs with a version 2 and tx version 2
@@ -96,6 +113,25 @@ impl PartiallySignedTransaction {
         self.inputs.push(inp);
     }
 
+    /// Add an input to pset at position i. This also updates the
+    /// pset global input count and the blinder index that might have shifted.
+    ///
+    /// See also: [`PartiallySignedTransaction::add_input`]
+    /// Panics if index is more than length.
+    pub fn insert_input(&mut self, inp: Input, pos: usize) {
+        self.global.tx_data.input_count += 1;
+        self.inputs.insert(pos, inp);
+
+        for out in self.outputs_mut() {
+            match out.blinder_index {
+                Some(i) if i >= pos as u32 => {
+                    out.blinder_index = Some(i + 1);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Read accessor to inputs
     pub fn inputs(&self) -> &[Input] {
         &self.inputs
@@ -111,7 +147,7 @@ impl PartiallySignedTransaction {
     pub fn remove_input(&mut self, index: usize) -> Option<Input> {
         if self.inputs.get(index).is_some() {
             self.global.tx_data.input_count -= 1;
-            return Some(self.inputs.remove(index))
+            return Some(self.inputs.remove(index));
         }
         None
     }
@@ -121,6 +157,14 @@ impl PartiallySignedTransaction {
     pub fn add_output(&mut self, out: Output) {
         self.global.tx_data.output_count += 1;
         self.outputs.push(out);
+    }
+
+    /// Add an output to pset at position i. This also updates the
+    /// pset global output count
+    /// Panics if index is more than length.
+    pub fn insert_output(&mut self, out: Output, pos: usize) {
+        self.global.tx_data.output_count += 1;
+        self.outputs.insert(pos, out);
     }
 
     /// read accessor to outputs
@@ -136,9 +180,9 @@ impl PartiallySignedTransaction {
     /// Remove the output at `index` and return it if any, otherwise returns None
     /// This also updates the pset global output count
     pub fn remove_output(&mut self, index: usize) -> Option<Output> {
-        if self.inputs.get(index).is_some() {
+        if self.outputs.get(index).is_some() {
             self.global.tx_data.output_count -= 1;
-            return Some(self.outputs.remove(index))
+            return Some(self.outputs.remove(index));
         }
         None
     }
@@ -154,48 +198,53 @@ impl PartiallySignedTransaction {
     }
 
     /// Accessor for the locktime to be used in the final transaction
-    pub fn locktime(&self) -> Result<u32, Error> {
+    #[allow(clippy::match_single_binding)]
+    pub fn locktime(&self) -> Result<LockTime, Error> {
         match self.global.tx_data {
-            GlobalTxData{ fallback_locktime, .. } => {
+            GlobalTxData {
+                fallback_locktime, ..
+            } => {
                 #[derive(PartialEq, Eq, PartialOrd, Ord)]
-                enum Locktime {
+                enum Locktime<T: Ord> {
                     /// No inputs have specified this type of locktime
                     Unconstrained,
                     /// The locktime must be at least this much
-                    Minimum(u32),
+                    Minimum(T),
                     /// Some input exclusively requires the other type of locktime
                     Disallowed,
                 }
 
-                let mut time_locktime = Locktime::Unconstrained;
-                let mut height_locktime = Locktime::Unconstrained;
+                let mut time_locktime = Locktime::<crate::locktime::Time>::Unconstrained;
+                let mut height_locktime = Locktime::<crate::locktime::Height>::Unconstrained;
                 for inp in &self.inputs {
                     match (inp.required_time_locktime, inp.required_height_locktime) {
                         (Some(rt), Some(rh)) => {
                             time_locktime = cmp::max(time_locktime, Locktime::Minimum(rt));
                             height_locktime = cmp::max(height_locktime, Locktime::Minimum(rh));
-                        },
+                        }
                         (Some(rt), None) => {
                             time_locktime = cmp::max(time_locktime, Locktime::Minimum(rt));
                             height_locktime = Locktime::Disallowed;
-                        },
+                        }
                         (None, Some(rh)) => {
                             time_locktime = Locktime::Disallowed;
                             height_locktime = cmp::max(height_locktime, Locktime::Minimum(rh));
-                        },
+                        }
                         (None, None) => {}
                     }
                 }
 
                 match (time_locktime, height_locktime) {
-                    (Locktime::Unconstrained, Locktime::Unconstrained) => Ok(fallback_locktime.unwrap_or(0)),
-                    (Locktime::Minimum(x), _) => Ok(x),
-                    (_, Locktime::Minimum(x)) => Ok(x),
+                    (Locktime::Unconstrained, Locktime::Unconstrained) => {
+                        Ok(fallback_locktime.map(LockTime::from).unwrap_or(LockTime::ZERO))
+                    }
+                    (Locktime::Minimum(x), _) => Ok(x.into()),
+                    (_, Locktime::Minimum(x)) => Ok(x.into()),
                     (Locktime::Disallowed, Locktime::Disallowed) => Err(Error::LocktimeConflict),
                     (Locktime::Unconstrained, Locktime::Disallowed) => unreachable!(),
                     (Locktime::Disallowed, Locktime::Unconstrained) => unreachable!(),
                 }
-            },
+            }
         }
     }
 
@@ -209,7 +258,7 @@ impl PartiallySignedTransaction {
         // transaction must be set to 0 (not final, nor the sequence in PSBT_IN_SEQUENCE).
         // The lock time in this unsigned transaction must be computed as described previously.
         for inp in tx.input.iter_mut() {
-            inp.sequence = 0;
+            inp.sequence = Sequence::from_height(0);
         }
         Ok(tx.txid())
     }
@@ -225,7 +274,6 @@ impl PartiallySignedTransaction {
         }
     }
 
-
     /// Extract the Transaction from a PartiallySignedTransaction by filling in
     /// the available signature information in place.
     pub fn extract_tx(&self) -> Result<Transaction, Error> {
@@ -239,17 +287,22 @@ impl PartiallySignedTransaction {
             let txin = TxIn {
                 previous_output: OutPoint::new(psetin.previous_txid, psetin.previous_output_index),
                 is_pegin: psetin.is_pegin(),
-                has_issuance: psetin.has_issuance(),
                 script_sig: psetin.final_script_sig.clone().unwrap_or_default(),
-                sequence: psetin.sequence.unwrap_or(0xffffffff),
+                sequence: psetin.sequence.unwrap_or(Sequence::MAX),
                 asset_issuance: psetin.asset_issuance(),
                 witness: TxInWitness {
                     amount_rangeproof: psetin.issuance_value_rangeproof.clone(),
                     inflation_keys_rangeproof: psetin.issuance_keys_rangeproof.clone(),
-                    script_witness: psetin.final_script_witness.as_ref()
-                        .map(|x| x.to_owned()).unwrap_or_default(),
-                    pegin_witness: psetin.pegin_witness.as_ref()
-                        .map(|x| x.to_owned()).unwrap_or_default(),
+                    script_witness: psetin
+                        .final_script_witness
+                        .as_ref()
+                        .map(|x| x.to_owned())
+                        .unwrap_or_default(),
+                    pegin_witness: psetin
+                        .pegin_witness
+                        .as_ref()
+                        .map(|x| x.to_owned())
+                        .unwrap_or_default(),
                 },
             };
             inputs.push(txin);
@@ -267,8 +320,9 @@ impl PartiallySignedTransaction {
                     (None, Some(x)) => confidential::Value::Explicit(x),
                     (None, None) => return Err(Error::MissingOutputAsset),
                 },
-                nonce: out.ecdh_pubkey
-                    .map(|x| confidential::Nonce::from(x.key))
+                nonce: out
+                    .ecdh_pubkey
+                    .map(|x| confidential::Nonce::from(x.inner))
                     .unwrap_or_default(),
                 script_pubkey: out.script_pubkey.clone(),
                 witness: TxOutWitness {
@@ -309,9 +363,10 @@ impl PartiallySignedTransaction {
     }
 
     // Common pset blinding checks
+    #[allow(clippy::type_complexity)] // FIXME we probably should actually factor out this return type
     fn blind_checks(
         &self,
-        inp_txout_sec: &[Option<&TxOutSecrets>],
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
     ) -> Result<
         (
             Vec<(u64, AssetBlindingFactor, ValueBlindingFactor)>,
@@ -319,10 +374,11 @@ impl PartiallySignedTransaction {
         ),
         PsetBlindError,
     > {
-        if inp_txout_sec.len() != self.inputs.len() {
-            return Err(PsetBlindError::InputTxOutSecretLen);
+        for (i, inp) in self.inputs.iter().enumerate() {
+            if inp.has_issuance() && inp.blinded_issuance.unwrap_or(1) == 1 {
+                return Err(PsetBlindError::BlindingIssuanceUnsupported(i));
+            }
         }
-
         let mut blind_out_indices = Vec::new();
         for (i, out) in self.outputs.iter().enumerate() {
             if out.blinding_key.is_none() {
@@ -335,7 +391,7 @@ impl PartiallySignedTransaction {
                         i,
                         blind_index as usize,
                     ));
-                } else if inp_txout_sec[blind_index as usize].is_none() {
+                } else if inp_txout_sec.get(&(blind_index as usize)).is_none() {
                     //nothing
                 } else {
                     // Output has corresponding input blinders
@@ -347,12 +403,60 @@ impl PartiallySignedTransaction {
         // collect input factors
         let inp_secrets = inp_txout_sec
             .iter()
-            .filter(|o| o.is_some())
-            .map(|o| o.unwrap())
-            .map(|o| (o.value, o.asset_bf, o.value_bf))
+            .map(|(_i, sec)| (sec.value, sec.asset_bf, sec.value_bf))
             .collect::<Vec<_>>();
 
         Ok((inp_secrets, blind_out_indices))
+    }
+
+    /// Obtains the surjection inputs for this pset. This servers as the domain
+    /// when creating a new [`SurjectionProof`]. Informally, the domain refers to the
+    /// set of inputs assets. For inputs whose [`TxOutSecrets`] is supplied,
+    /// [`SurjectionInput::Known`] variant is created. For confidential inputs whose secrets
+    /// are not supplied [`SurjectionInput::Unknown`] variant is created.
+    /// For non-confidential inputs, [`SurjectionInput::Known`] variant is created with zero
+    /// blinding factors.
+    pub fn surjection_inputs(
+        &self,
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
+    ) -> Result<Vec<SurjectionInput>, PsetBlindError> {
+        let mut ret = vec![];
+        for (i, inp) in self.inputs().iter().enumerate() {
+            let utxo = inp
+                .witness_utxo
+                .as_ref()
+                .ok_or(PsetBlindError::MissingWitnessUtxo(i))?;
+            let surject_target = match inp_txout_sec.get(&i) {
+                Some(sec) => SurjectionInput::from_txout_secrets(*sec),
+                None => SurjectionInput::Unknown(utxo.asset),
+            };
+            ret.push(surject_target);
+
+            if inp.has_issuance() {
+                let (asset_id, token_id) = inp.issuance_ids();
+                if inp.issuance_value_amount.is_some() || inp.issuance_value_comm.is_some() {
+                    let secrets = TxOutSecrets {
+                        asset: asset_id,
+                        asset_bf: AssetBlindingFactor::zero(),
+                        value: 0, // This value really does not matter in surjection proofs
+                        value_bf: ValueBlindingFactor::zero(),
+                    };
+                    ret.push(SurjectionInput::from_txout_secrets(secrets))
+                }
+                if inp.issuance_inflation_keys.is_some()
+                    || inp.issuance_inflation_keys_comm.is_some()
+                {
+                    let secrets = TxOutSecrets {
+                        asset: token_id,
+                        asset_bf: AssetBlindingFactor::zero(),
+                        value: 0, // This value really does not matter in surjection proofs
+                        value_bf: ValueBlindingFactor::zero(),
+                    };
+                    ret.push(SurjectionInput::from_txout_secrets(secrets))
+                }
+            }
+        }
+        Ok(ret)
     }
 
     /// Blind the pset as the non-last blinder role. The last blinder of pset
@@ -361,15 +465,19 @@ impl PartiallySignedTransaction {
     /// For each output that is to be blinded, the following must be true
     /// 1. The blinder_index must be set in pset output field
     /// 2. the corresponding inp_secrets\[out.blinder_index\] must be present
+    ///
+    /// Issuances and re-issuance inputs are not blinded.
     /// # Parameters
     ///
     /// * `inp_secrets`: [`TxOutSecrets`] corresponding to owned inputs. Use [`None`] for non-owned outputs
     ///
+    // Blinding issuances is not currently supported. We have no way in pset to specify
+    // which issuances we want to blind
     pub fn blind_non_last<C: secp256k1_zkp::Signing, R: RngCore + CryptoRng>(
         &mut self,
         rng: &mut R,
         secp: &secp256k1_zkp::Secp256k1<C>,
-        inp_txout_sec: &[Option<&TxOutSecrets>],
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
     ) -> Result<Vec<(AssetBlindingFactor, ValueBlindingFactor)>, PsetBlindError> {
         let (inp_secrets, outs_to_blind) = self.blind_checks(inp_txout_sec)?;
 
@@ -378,34 +486,25 @@ impl PartiallySignedTransaction {
             return Ok(Vec::new());
         }
         // Blind each output as non-last and save the secrets
-        let spent_utxos = self
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, x)| x.witness_utxo.as_ref().ok_or(PsetBlindError::MissingWitnessUtxo(i)))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let spent_utxo_secrets = spent_utxos
-            .iter()
-            .map(|x| x.asset)
-            .zip(inp_txout_sec.iter().map(|x| *x))
-            .collect::<Vec<(_, _)>>();
+        let surject_inputs = self.surjection_inputs(inp_txout_sec)?;
         let mut out_secrets = vec![];
         let mut ret = vec![]; // return all the random values used
         for i in outs_to_blind {
-            let mut txout = self.outputs[i].to_txout();
-            let (abf, vbf) = txout
+            let txout = self.outputs[i].to_txout();
+            let (txout, abf, vbf, _) = txout
                 .to_non_last_confidential(
                     rng,
                     secp,
                     self.outputs[i]
                         .blinding_key
-                        .map(|x| x.key)
+                        .map(|x| x.inner)
                         .ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?,
-                    &spent_utxo_secrets,
+                    &surject_inputs,
                 )
                 .map_err(|e| PsetBlindError::ConfidentialTxOutError(i, e))?;
-            let value = self.outputs[i].amount.ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?;
+            let value = self.outputs[i]
+                .amount
+                .ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?;
             out_secrets.push((value, abf, vbf));
 
             // mutate the pset
@@ -414,18 +513,29 @@ impl PartiallySignedTransaction {
                 self.outputs[i].asset_surjection_proof = txout.witness.surjection_proof;
                 self.outputs[i].amount_comm = txout.value.commitment();
                 self.outputs[i].asset_comm = txout.asset.commitment();
-                self.outputs[i].ecdh_pubkey = txout.nonce.commitment().map(|pk| bitcoin::PublicKey{
-                    key: pk,
-                    compressed: true
-                });
-                let asset_id = self.outputs[i].asset.ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?;
-                self.outputs[i].blind_asset_proof = Some(SurjectionProof::blind_asset_proof(rng, secp, asset_id, abf)
-                    .map_err(|e| PsetBlindError::BlindingProofsCreationError(i, e))?);
+                self.outputs[i].ecdh_pubkey =
+                    txout.nonce.commitment().map(|pk| bitcoin::PublicKey {
+                        inner: pk,
+                        compressed: true,
+                    });
+                let asset_id = self.outputs[i]
+                    .asset
+                    .ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?;
+                self.outputs[i].blind_asset_proof = Some(Box::new(
+                    SurjectionProof::blind_asset_proof(rng, secp, asset_id, abf)
+                        .map_err(|e| PsetBlindError::BlindingProofsCreationError(i, e))?,
+                ));
 
-                let asset_gen = self.outputs[i].asset_comm.expect("Blinding proof creation error");
-                let value_comm = self.outputs[i].amount_comm.expect("Blinding proof successful");
-                self.outputs[i].blind_value_proof = Some(RangeProof::blind_value_proof(rng, secp, value, value_comm, asset_gen, vbf)
-                    .map_err(|e| PsetBlindError::BlindingProofsCreationError(i, e))?);
+                let asset_gen = self.outputs[i]
+                    .asset_comm
+                    .expect("Blinding proof creation error");
+                let value_comm = self.outputs[i]
+                    .amount_comm
+                    .expect("Blinding proof successful");
+                self.outputs[i].blind_value_proof = Some(Box::new(
+                    RangeProof::blind_value_proof(rng, secp, value, value_comm, asset_gen, vbf)
+                        .map_err(|e| PsetBlindError::BlindingProofsCreationError(i, e))?,
+                ));
             }
             // return blinding factors used
             ret.push((abf, vbf));
@@ -449,7 +559,7 @@ impl PartiallySignedTransaction {
         // Push the scalar
         // BUG in pset
         // Bug in Pset, scalars can be the same value, but there is no place
-        // in pset to place them as it would break the uniqueness constriant.
+        // in pset to place them as it would break the uniqueness constraint.
         self.global.scalars.push(vbf2.into_inner());
         Ok(ret)
     }
@@ -468,7 +578,7 @@ impl PartiallySignedTransaction {
         &mut self,
         rng: &mut R,
         secp: &secp256k1_zkp::Secp256k1<C>,
-        inp_txout_sec: &[Option<&TxOutSecrets>],
+        inp_txout_sec: &HashMap<usize, TxOutSecrets>,
     ) -> Result<(), PsetBlindError> {
         let (mut inp_secrets, mut outs_to_blind) = self.blind_checks(inp_txout_sec)?;
 
@@ -492,105 +602,91 @@ impl PartiallySignedTransaction {
             inp_secrets = vec![];
         }
         // blind the last txout
-        let asset = self.outputs[last_out_index].asset.ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
-        let value = self.outputs[last_out_index].amount.ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
-        let out_abf = AssetBlindingFactor::new(rng);
-        let out_asset = confidential::Asset::new_confidential(secp, asset, out_abf);
-        let out_asset_commitment = out_asset.commitment().expect("confidential asset");
 
+        let surject_inputs = self.surjection_inputs(inp_txout_sec)?;
+        let asset_id = self.outputs[last_out_index]
+            .asset
+            .ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
+        let out_abf = AssetBlindingFactor::new(rng);
+        let exp_asset = confidential::Asset::Explicit(asset_id);
+        let blind_res = exp_asset.blind(rng, secp, out_abf, &surject_inputs);
+
+        let (out_asset_commitment, surjection_proof) =
+            blind_res.map_err(|e| PsetBlindError::ConfidentialTxOutError(last_out_index, e))?;
+
+        let value = self.outputs[last_out_index]
+            .amount
+            .ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
+        let exp_value = confidential::Value::Explicit(value);
         // Get all the explicit outputs
         let mut exp_out_secrets = vec![];
         for (i, out) in self.outputs.iter().enumerate() {
             if out.blinding_key.is_none() {
                 let amt = out.amount.ok_or(PsetBlindError::MustHaveExplicitTxOut(i))?;
-                exp_out_secrets.push((amt, AssetBlindingFactor::zero(), ValueBlindingFactor::zero()));
+                exp_out_secrets.push((
+                    amt,
+                    AssetBlindingFactor::zero(),
+                    ValueBlindingFactor::zero(),
+                ));
             }
         }
-        let mut final_vbf = ValueBlindingFactor::last(
-            secp,
-            value,
-            out_abf,
-            &inp_secrets,
-            &exp_out_secrets,
-        );
+        let mut final_vbf =
+            ValueBlindingFactor::last(secp, value, out_abf, &inp_secrets, &exp_out_secrets);
 
         // Add all the scalars
         for value_diff in self.global.scalars.iter() {
             final_vbf += ValueBlindingFactor(*value_diff);
         }
-        let value_commitment = confidential::Value::new_confidential(secp, value, out_asset_commitment, final_vbf);
-
-        let value_commitment = value_commitment.commitment().expect("confidential value");
 
         let receiver_blinding_pk = &self.outputs[last_out_index]
             .blinding_key
             .ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
-        let (nonce, shared_secret) = confidential::Nonce::new_confidential(rng, secp, &receiver_blinding_pk.key);
-
-        let message = RangeProofMessage { asset, bf: out_abf };
-        let rangeproof = RangeProof::new(
+        let ephemeral_sk = SecretKey::new(rng);
+        let spk = &self.outputs[last_out_index].script_pubkey;
+        let msg = RangeProofMessage {
+            asset: asset_id,
+            bf: out_abf,
+        };
+        let blind_res = exp_value.blind(
             secp,
-            TxOut::RANGEPROOF_MIN_VALUE,
-            value_commitment,
-            value,
-            final_vbf.0,
-            &message.to_bytes(),
-            self.outputs[last_out_index].script_pubkey.as_bytes().as_ref(),
-            shared_secret,
-            TxOut::RANGEPROOF_EXP_SHIFT,
-            TxOut::RANGEPROOF_MIN_PRIV_BITS,
-            out_asset_commitment,
-        ).map_err(|e| PsetBlindError::ConfidentialTxOutError(last_out_index,  ConfidentialTxOutError::Upstream(e)))?;
-
-        // Blind each output as non-last and save the secrets
-        let spent_utxos = self
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(i, x)| x.witness_utxo.as_ref().ok_or(PsetBlindError::MissingWitnessUtxo(i)))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let spent_utxo_secrets = spent_utxos
-            .iter()
-            .map(|x| x.asset)
-            .zip(inp_txout_sec.iter().map(|x| *x))
-            .collect::<Vec<(_, _)>>();
-
-        let inputs = spent_utxo_secrets
-            .iter()
-            .enumerate()
-            .map(|(i, (asset, sec))| {
-                TxOutSecrets::surjection_inputs(*sec, secp, *asset)
-                    .map_err(|_e| PsetBlindError::MissingInputBlinds(last_out_index, i))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let surjection_proof = SurjectionProof::new(
-            secp,
-            rng,
-            asset.into_tag(),
-            out_abf.into_inner(),
-            inputs.as_ref(),
-        ).map_err(|e| PsetBlindError::ConfidentialTxOutError(last_out_index,  ConfidentialTxOutError::Upstream(e)))?;
+            final_vbf,
+            receiver_blinding_pk.inner,
+            ephemeral_sk,
+            spk,
+            &msg,
+        );
+        let (value_commitment, nonce, rangeproof) =
+            blind_res.map_err(|e| PsetBlindError::ConfidentialTxOutError(last_out_index, e))?;
 
         // mutate the pset
         {
-            self.outputs[last_out_index].value_rangeproof = Some(rangeproof);
-            self.outputs[last_out_index].asset_surjection_proof = Some(surjection_proof);
-            self.outputs[last_out_index].amount_comm = Some(value_commitment);
-            self.outputs[last_out_index].asset_comm = Some(out_asset_commitment);
-            self.outputs[last_out_index].ecdh_pubkey = nonce.commitment().map(|pk| bitcoin::PublicKey{
-                key: pk,
-                compressed: true
-            });
-            let asset_id = self.outputs[last_out_index].asset.ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
-            self.outputs[last_out_index].blind_asset_proof = Some(SurjectionProof::blind_asset_proof(rng, secp, asset_id, out_abf)
-                .map_err(|e| PsetBlindError::BlindingProofsCreationError(last_out_index, e))?);
+            self.outputs[last_out_index].value_rangeproof = Some(Box::new(rangeproof));
+            self.outputs[last_out_index].asset_surjection_proof = Some(Box::new(surjection_proof));
+            self.outputs[last_out_index].amount_comm = value_commitment.commitment();
+            self.outputs[last_out_index].asset_comm = out_asset_commitment.commitment();
+            self.outputs[last_out_index].ecdh_pubkey =
+                nonce.commitment().map(|pk| bitcoin::PublicKey {
+                    inner: pk,
+                    compressed: true,
+                });
+            let asset_id = self.outputs[last_out_index]
+                .asset
+                .ok_or(PsetBlindError::MustHaveExplicitTxOut(last_out_index))?;
+            self.outputs[last_out_index].blind_asset_proof = Some(Box::new(
+                SurjectionProof::blind_asset_proof(rng, secp, asset_id, out_abf)
+                    .map_err(|e| PsetBlindError::BlindingProofsCreationError(last_out_index, e))?,
+            ));
 
-            let asset_gen = self.outputs[last_out_index].asset_comm.expect("Blinding proof creation error");
-            let value_comm = self.outputs[last_out_index].amount_comm.expect("Blinding proof successful");
-            self.outputs[last_out_index].blind_value_proof = Some(RangeProof::blind_value_proof(rng, secp, value, value_comm, asset_gen, final_vbf)
-                .map_err(|e| PsetBlindError::BlindingProofsCreationError(last_out_index, e))?);
+            let asset_gen = self.outputs[last_out_index]
+                .asset_comm
+                .expect("Blinding proof creation error");
+            let value_comm = self.outputs[last_out_index]
+                .amount_comm
+                .expect("Blinding proof successful");
+            self.outputs[last_out_index].blind_value_proof = Some(Box::new(
+                RangeProof::blind_value_proof(rng, secp, value, value_comm, asset_gen, final_vbf)
+                    .map_err(|e| PsetBlindError::BlindingProofsCreationError(last_out_index, e))?,
+            ));
 
             self.global.scalars.clear()
         }
@@ -620,7 +716,7 @@ impl Encodable for PartiallySignedTransaction {
 }
 
 impl Decodable for PartiallySignedTransaction {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
         let magic: [u8; 4] = Decodable::consensus_decode(&mut d)?;
 
         if *b"pset" != magic {
@@ -667,11 +763,7 @@ impl Decodable for PartiallySignedTransaction {
             outputs
         };
 
-        let pset = PartiallySignedTransaction {
-            global: global,
-            inputs: inputs,
-            outputs: outputs,
-        };
+        let pset = PartiallySignedTransaction { global, inputs, outputs };
         pset.sanity_check()?;
         Ok(pset)
     }
@@ -680,27 +772,29 @@ impl Decodable for PartiallySignedTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitcoin::hashes::hex::{FromHex, ToHex};
+    use crate::hex::{FromHex, ToHex};
 
     fn tx_pset_rtt(tx_hex: &str) {
-        let tx: Transaction = encode::deserialize(&Vec::<u8>::from_hex(tx_hex).unwrap()[..]).unwrap();
+        let tx: Transaction =
+            encode::deserialize(&Vec::<u8>::from_hex(tx_hex).unwrap()[..]).unwrap();
         let pset = PartiallySignedTransaction::from_tx(tx);
         let rtt_tx_hex = encode::serialize_hex(&pset.extract_tx().unwrap());
         assert_eq!(tx_hex, rtt_tx_hex);
         let pset_rtt_hex = encode::serialize_hex(&pset);
-        let pset2 : PartiallySignedTransaction = encode::deserialize(&Vec::<u8>::from_hex(&pset_rtt_hex).unwrap()[..]).unwrap();
+        let pset2: PartiallySignedTransaction =
+            encode::deserialize(&Vec::<u8>::from_hex(&pset_rtt_hex).unwrap()[..]).unwrap();
         assert_eq!(pset, pset2);
     }
 
     fn pset_rtt(pset_hex: &str) {
-        let pset: PartiallySignedTransaction = encode::deserialize(&Vec::<u8>::from_hex(pset_hex).unwrap()[..]).unwrap();
+        let pset: PartiallySignedTransaction =
+            encode::deserialize(&Vec::<u8>::from_hex(pset_hex).unwrap()[..]).unwrap();
 
         assert_eq!(encode::serialize_hex(&pset), pset_hex);
     }
 
     #[test]
-    fn test_pset(){
-
+    fn test_pset() {
         tx_pset_rtt("010000000001715df5ccebaf02ff18d6fae7263fa69fed5de59c900f4749556eba41bc7bf2af0000000000000000000201230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000124101100001f5175517551755175517551755175517551755175517551755175517551755101230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b2010000000005f5e100000000000000");
 
         // Test a issuance test with only sighash all
@@ -719,18 +813,19 @@ mod tests {
 
     #[test]
     fn single_blinded_output_pset() {
-        use std::str::FromStr;
+        use crate::AssetId;
         use rand::{self, SeedableRng};
         use serde_json;
-        use AssetId;
+        use std::str::FromStr;
 
         // Initially secp context and rng global state
         let secp = secp256k1_zkp::Secp256k1::new();
         #[allow(deprecated)]
-        let mut rng = rand::ChaChaRng::seed_from_u64(0);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
 
         let pset_hex = "70736574ff01020402000000010401010105010201fb04020000000001017a0bb9325c276764451bbc2eb82a4c8c4bb6f4007ba803e5a5ba72d0cd7c09848e1a091622d935953bf06e0b7393239c68c6f810a00fe19d11c6ae343cffd3037077da02535fe4ad0fcd675cd0f62bf73b60a554dc1569b80f1f76a2bbfc9f00d439bf4b160014d2cbec8783bd01c9f178348b08500a830a89a7f9010e20805131ba6b37165c026eed9325ac56059ba872fd569e3ed462734098688b4770010f0400000000000103088c83b50d0000000007fc04707365740220230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b20104220020e5793ad956ee91ebf3543b37d110701118ed4078ffa0d477eacb8885e486ad8507fc047073657406210212bf0ea45b733dfde8ecb5e896306c4165c666c99fc5d1ab887f71393a975cea07fc047073657408040000000000010308f40100000000000007fc04707365740220230f4f5d4b7c6fa845806ee4f67713459e1b69e8e60fcee2e4940c7a0d5de1b201040000";
-        let mut pset : PartiallySignedTransaction = encode::deserialize(&Vec::<u8>::from_hex(&pset_hex).unwrap()[..]).unwrap();
+        let mut pset: PartiallySignedTransaction =
+            encode::deserialize(&Vec::<u8>::from_hex(pset_hex).unwrap()[..]).unwrap();
 
         let btc_txout_secrets_str = r#"
         {
@@ -741,26 +836,24 @@ mod tests {
         }"#;
         let v: serde_json::Value = serde_json::from_str(btc_txout_secrets_str).unwrap();
         let btc_txout_secrets = TxOutSecrets {
-            asset_bf: AssetBlindingFactor::from_str(&v["assetblinder"].as_str().unwrap()).unwrap(),
-            value_bf: ValueBlindingFactor::from_str(&v["amountblinder"].as_str().unwrap()).unwrap(),
+            asset_bf: AssetBlindingFactor::from_str(v["assetblinder"].as_str().unwrap()).unwrap(),
+            value_bf: ValueBlindingFactor::from_str(v["amountblinder"].as_str().unwrap()).unwrap(),
             value: bitcoin::Amount::from_str_in(
-                &v["amount"].as_str().unwrap(),
+                v["amount"].as_str().unwrap(),
                 bitcoin::Denomination::Bitcoin,
             )
             .unwrap()
-            .as_sat(),
-            asset: AssetId::from_hex(&v["asset"].as_str().unwrap()).unwrap(),
+            .to_sat(),
+            asset: AssetId::from_str(v["asset"].as_str().unwrap()).unwrap(),
         };
 
-        let inp_txout_sec = [
-            Some(&btc_txout_secrets),
-        ];
+        let mut inp_txout_sec = HashMap::new();
+        inp_txout_sec.insert(0, btc_txout_secrets);
         pset.blind_last(&mut rng, &secp, &inp_txout_sec).unwrap();
 
         let tx = pset.extract_tx().unwrap();
         let btc_txout = pset.inputs[0].witness_utxo.clone().unwrap();
-        tx.verify_tx_amt_proofs(&secp, &[btc_txout])
-            .unwrap();
+        tx.verify_tx_amt_proofs(&secp, &[btc_txout]).unwrap();
     }
 
     #[test]
@@ -768,46 +861,63 @@ mod tests {
         // Invalid psets
         // Check Global mandatory field
         let pset_str = "70736574ff010401000105010001fb040200000000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Missing tx version");
 
         // Check input mandatory field
         let pset_str = "70736574ff010204020000000104010001fb040200000000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Missing inp count");
 
         let pset_str = "70736574ff010204020000000105010001fb040200000000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Missing out count");
 
         let pset_str = "70736574ff01020402000000010401000105010000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Missing pset version");
         // Check inp/out count mismatch
         let pset_str = "70736574ff01020402000000010401000105010001fb04020000000001017a0ad92644e9bf6cb8d0856a8ca713c8a212d3a62142e85454b7865217890e52ec3108a469a9811ec1c1df7a98dbc3a7f71860293e98c6fad8a7ef6828344e9172547302217d344513f0a5ed1a60ebeba01460c505ad63d95b3542fb303aca8f9382777d160014bd5c31aaea2ddc585f317ee589bc6800bc95e7e6010e208965573f41392a88d8bb106cf13a7bdc69f1ab914cd5e8de11235467b514e5a9010f040100000000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Input count mismatch");
 
         // input mandatory field
         let pset_str = "70736574ff01020402000000010401010105010001fb04020000000001017a0ad92644e9bf6cb8d0856a8ca713c8a212d3a62142e85454b7865217890e52ec3108a469a9811ec1c1df7a98dbc3a7f71860293e98c6fad8a7ef6828344e9172547302217d344513f0a5ed1a60ebeba01460c505ad63d95b3542fb303aca8f9382777d160014bd5c31aaea2ddc585f317ee589bc6800bc95e7e601010f040100000000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Input mandatory field prevtxid");
 
         // output mandatory amount field
         let pset_str = "70736574ff01020402000000010401000105010101fb04020000000007fc04707365740220010101010101010101010101010101010101010101010101010101010101010101040000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Output non-mandatory field");
 
         let pset_str = "70736574ff01020402000000010401000105010101fb040200000000010308170000000000000007fc0470736574022009090909090909090909090909090909090909090909090909090909090909090100";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect_err("Output mandatory field script pubkey");
-
 
         // Valid Psets
 
         // Check both possible conf/explicit values are allowed for pset
         let pset_str = "70736574ff01020402000000010401000105010101fb040200000000010308170000000000000007fc0470736574012109090909090909090909090909090909090909090909090909090909090909090907fc04707365740220090909090909090909090909090909090909090909090909090909090909090901040000";
-        let pset = encode::deserialize::<PartiallySignedTransaction>(&Vec::<u8>::from_hex(pset_str).unwrap()[..]);
+        let pset = encode::deserialize::<PartiallySignedTransaction>(
+            &Vec::<u8>::from_hex(pset_str).unwrap()[..],
+        );
         pset.expect("Both conf/explicit value are allowed be present in map");
 
         // Commented code for quick test vector generation
@@ -822,7 +932,6 @@ mod tests {
         // };
         // pset.add_output(Output::from_txout(txout));
         // println!("{}", encode::serialize_hex(&pset));
-
 
         // // Commit an asset
         // let mut pset = PartiallySignedTransaction::new_v2();
@@ -852,5 +961,87 @@ mod tests {
         let bytes = Vec::<u8>::from_hex(&back_hex).unwrap();
         let pset = encode::deserialize::<PartiallySignedTransaction>(&bytes).unwrap();
         assert_eq!(&back_hex, &encode::serialize(&pset).to_hex());
+    }
+
+    #[test]
+    fn pset_remove_in_out() {
+        let pset_str = include_str!("../../tests/data/pset_swap_tutorial.hex");
+
+        let bytes = Vec::<u8>::from_hex(pset_str).unwrap();
+        let mut pset = encode::deserialize::<PartiallySignedTransaction>(&bytes).unwrap();
+
+        let n_inputs = pset.n_inputs();
+        let n_outputs = pset.n_outputs();
+        pset.remove_input(n_inputs - 1).unwrap();
+        pset.remove_output(n_outputs - 1).unwrap();
+        assert_eq!(pset.n_inputs(), n_inputs - 1);
+        assert_eq!(pset.n_outputs(), n_outputs - 1);
+    }
+
+    #[test]
+    fn pset_issuance() {
+        use std::str::FromStr;
+        use rand::{self, SeedableRng};
+        let secp = secp256k1_zkp::Secp256k1::new();
+        #[allow(deprecated)]
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0);
+
+        let policy = crate::AssetId::from_str("5ac9f65c0efcc4775e0baec4ec03abdde22473cd3cf33c0419ca290e0751b225").unwrap();
+        let pk = bitcoin::key::PublicKey::from_str("020202020202020202020202020202020202020202020202020202020202020202").unwrap();
+        let script = crate::Script::from_hex("0014d2bcde17e7744f6377466ca1bd35d212954674c8").unwrap();
+        let sats_in = 10000;
+        let sats_fee = 1000;
+        let btc_txout_secrets = TxOutSecrets {
+            asset_bf: AssetBlindingFactor::from_str("1111111111111111111111111111111111111111111111111111111111111111").unwrap(),
+            value_bf: ValueBlindingFactor::from_str("2222222222222222222222222222222222222222222222222222222222222222").unwrap(),
+            value: sats_in,
+            asset: policy,
+        };
+        let previous_output = TxOut::default();  // Does not match btc_txout_secrets
+        let prevout = OutPoint::default();
+        let sats_asset = 10;
+        let sats_token = 1;
+
+        let mut pset = PartiallySignedTransaction::new_v2();
+        let mut input = Input::from_prevout(prevout);
+        input.witness_utxo = Some(previous_output);
+        input.issuance_value_amount = Some(sats_asset);
+        input.issuance_inflation_keys = Some(sats_token);
+        let (asset, token) = input.issuance_ids();
+        pset.add_input(input);
+
+        // Add asset
+        let mut output = Output::new_explicit(script.clone(), sats_asset, asset, Some(pk));
+        output.blinder_index = Some(0);
+        pset.add_output(output);
+        // Add token
+        let mut output = Output::new_explicit(script.clone(), sats_token, token, Some(pk));
+        output.blinder_index = Some(0);
+        pset.add_output(output);
+        // Add L-BTC
+        let mut output = Output::new_explicit(script.clone(), sats_in - sats_fee, policy, Some(pk));
+        output.blinder_index = Some(0);
+        pset.add_output(output);
+        // Add fee
+        let output = Output::new_explicit(crate::Script::new(), sats_fee, policy, None);
+        pset.add_output(output);
+
+        let mut inp_txout_sec = HashMap::new();
+        inp_txout_sec.insert(0, btc_txout_secrets);
+
+        let err = pset.blind_last(&mut rng, &secp, &inp_txout_sec).unwrap_err();
+        assert_eq!(err, PsetBlindError::BlindingIssuanceUnsupported(0));
+
+        let input = &mut pset.inputs_mut()[0];
+        input.blinded_issuance = Some(0x01);
+        let err = pset.blind_last(&mut rng, &secp, &inp_txout_sec).unwrap_err();
+        assert_eq!(err, PsetBlindError::BlindingIssuanceUnsupported(0));
+
+        let input = &mut pset.inputs_mut()[0];
+        input.blinded_issuance = Some(0x00);
+        pset.blind_last(&mut rng, &secp, &inp_txout_sec).unwrap();
+        let pset_bytes = encode::serialize(&pset);
+        let pset_des = encode::deserialize(&pset_bytes).unwrap();
+        assert_eq!(pset, pset_des);
     }
 }

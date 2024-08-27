@@ -27,13 +27,17 @@
 use std::default::Default;
 use std::{fmt, io, ops, str};
 
+use secp256k1_zkp::{Verification, Secp256k1};
 #[cfg(feature = "serde")] use serde;
 
-use encode::{self, Decodable, Encodable};
-use bitcoin::hashes::{Hash, hex};
-use {opcodes, ScriptHash, WScriptHash, PubkeyHash, WPubkeyHash};
+use crate::encode::{self, Decodable, Encodable};
+use crate::hashes::Hash;
+use crate::{hex, opcodes, ScriptHash, WScriptHash, PubkeyHash, WPubkeyHash};
 
 use bitcoin::PublicKey;
+
+use crate::schnorr::{UntweakedPublicKey, TweakedPublicKey, TapTweak};
+use crate::taproot::TapNodeHash;
 
 const MAX_SCRIPT_SIZE : usize = 10_000;
 
@@ -257,16 +261,29 @@ impl Script {
 
     /// Generates P2WPKH-type of scriptPubkey
     pub fn new_v0_wpkh(pubkey_hash: &WPubkeyHash) -> Script {
-        Script::new_witness_program(::bech32::u5::try_from_u8(0).unwrap(), &pubkey_hash.to_vec())
+        Script::new_witness_program(bech32::Fe32::Q, &pubkey_hash.to_raw_hash().to_byte_array())
     }
 
     /// Generates P2WSH-type of scriptPubkey with a given hash of the redeem script
     pub fn new_v0_wsh(script_hash: &WScriptHash) -> Script {
-        Script::new_witness_program(::bech32::u5::try_from_u8(0).unwrap(), &script_hash.to_vec())
+        Script::new_witness_program(bech32::Fe32::Q, &script_hash.to_raw_hash().to_byte_array())
     }
 
+    /// Generates P2TR for script spending path using an internal public key and some optional
+    /// script tree merkle root.
+    pub fn new_v1_p2tr<C: Verification>(secp: &Secp256k1<C>, internal_key: UntweakedPublicKey, merkle_root: Option<TapNodeHash>) -> Script {
+        let (output_key, _) = internal_key.tap_tweak(secp, merkle_root);
+        Script::new_witness_program(bech32::Fe32::P, &output_key.as_inner().serialize())
+    }
+
+    /// Generates P2TR for key spending path for a known [`TweakedPublicKey`].
+    pub fn new_v1_p2tr_tweaked(output_key: TweakedPublicKey) -> Script {
+        Script::new_witness_program(bech32::Fe32::P, &output_key.as_inner().serialize())
+    }
+
+
     /// Generates P2WSH-type of scriptPubkey with a given hash of the redeem script
-    pub fn new_witness_program(ver: ::bech32::u5, program: &[u8]) -> Script {
+    pub fn new_witness_program(ver: bech32::Fe32, program: &[u8]) -> Script {
         let mut verop = ver.to_u8();
         assert!(verop <= 16, "incorrect witness version provided: {}", verop);
         if verop > 0 {
@@ -274,7 +291,7 @@ impl Script {
         }
         Builder::new()
             .push_opcode(verop.into())
-            .push_slice(&program)
+            .push_slice(program)
             .into_script()
     }
 
@@ -288,12 +305,12 @@ impl Script {
 
     /// Returns 160-bit hash of the script
     pub fn script_hash(&self) -> ScriptHash {
-        ScriptHash::hash(&self.as_bytes())
+        ScriptHash::hash(self.as_bytes())
     }
 
     /// Returns 256-bit hash of the script for P2WSH outputs
     pub fn wscript_hash(&self) -> WScriptHash {
-        WScriptHash::hash(&self.as_bytes())
+        WScriptHash::hash(self.as_bytes())
     }
 
     /// The length in bytes of the script
@@ -303,7 +320,7 @@ impl Script {
     pub fn is_empty(&self) -> bool { self.0.is_empty() }
 
     /// Returns the script data
-    pub fn as_bytes(&self) -> &[u8] { &*self.0 }
+    pub fn as_bytes(&self) -> &[u8] { &self.0 }
 
     /// Returns a copy of the script data
     pub fn to_bytes(&self) -> Vec<u8> { self.0.clone().into_vec() }
@@ -386,6 +403,24 @@ impl Script {
         self.0[1] == opcodes::all::OP_PUSHBYTES_32.into_u8()
     }
 
+    /// Checks whether a script pubkey is a P2TR output.
+    #[inline]
+    pub fn is_v1_p2tr(&self) -> bool {
+        self.0.len() == 34 &&
+        self.0[0] == opcodes::all::OP_PUSHNUM_1.into_u8() &&
+        self.0[1] == opcodes::all::OP_PUSHBYTES_32.into_u8()
+    }
+
+    /// Checks whether a script pubkey is a p2wsh output
+    #[inline]
+    pub fn is_v1plus_p2witprog(&self) -> bool {
+        self.0.len() > 1 &&
+        self.0.len() == self.0[1] as usize + 2 &&
+        self.0[0] >= opcodes::all::OP_PUSHNUM_1.into_u8() &&
+        self.0[0] <= opcodes::all::OP_PUSHNUM_16.into_u8() &&
+        self.0[1] <= opcodes::all::OP_PUSHBYTES_40.into_u8()
+    }
+
     /// Checks whether a script pubkey is a p2wpkh output
     #[inline]
     pub fn is_v0_p2wpkh(&self) -> bool {
@@ -413,7 +448,7 @@ impl Script {
     /// iterator will end. To instead iterate over the script as sequence of bytes, treat
     /// it as a slice using `script[..]` or convert it to a vector using `into_bytes()`.
     ///
-    /// To force minimal pushes, use [instructions_minimal].
+    /// To force minimal pushes, use [Script::instructions_minimal].
     pub fn instructions(&self) -> Instructions {
         Instructions {
             data: &self.0[..],
@@ -437,7 +472,7 @@ impl Script {
             let opcode = opcodes::All::from(self.0[index]);
             index += 1;
 
-            let data_len = if let opcodes::Class::PushBytes(n) = opcode.classify() {
+            let data_len = if let opcodes::Class::PushBytes(n) = opcode.classify(opcodes::ClassifyContext::Legacy) {
                 n as usize
             } else {
                 match opcode {
@@ -447,7 +482,7 @@ impl Script {
                             break;
                         }
                         match read_uint(&self.0[index..], 1) {
-                            Ok(n) => { index += 1; n as usize }
+                            Ok(n) => { index += 1; n }
                             Err(_) => { f.write_str("<bad length>")?; break; }
                         }
                     }
@@ -457,7 +492,7 @@ impl Script {
                             break;
                         }
                         match read_uint(&self.0[index..], 2) {
-                            Ok(n) => { index += 2; n as usize }
+                            Ok(n) => { index += 2; n }
                             Err(_) => { f.write_str("<bad length>")?; break; }
                         }
                     }
@@ -467,7 +502,7 @@ impl Script {
                             break;
                         }
                         match read_uint(&self.0[index..], 4) {
-                            Ok(n) => { index += 4; n as usize }
+                            Ok(n) => { index += 4; n }
                             Err(_) => { f.write_str("<bad length>")?; break; }
                         }
                     }
@@ -556,6 +591,26 @@ pub enum Instruction<'a> {
     Op(opcodes::All),
 }
 
+impl<'a> Instruction<'a> {
+    /// Get the opcode in case of [Instruction::Op].
+    pub fn op(&self) -> Option<opcodes::All> {
+        if let Instruction::Op(o) = self {
+            Some(*o)
+        } else {
+            None
+        }
+    }
+
+    /// Get the push bytes in case of [Instruction::PushBytes].
+    pub fn push_bytes(&self) -> Option<&'a [u8]> {
+        if let Instruction::PushBytes(p) = self {
+            Some(p)
+        } else {
+            None
+        }
+    }
+}
+
 /// Iterator over a script returning parsed opcodes
 pub struct Instructions<'a> {
     data: &'a [u8],
@@ -570,7 +625,7 @@ impl<'a> Iterator for Instructions<'a> {
             return None;
         }
 
-        match opcodes::All::from(self.data[0]).classify() {
+        match opcodes::All::from(self.data[0]).classify(opcodes::ClassifyContext::Legacy) {
             opcodes::Class::PushBytes(n) => {
                 let n = n as usize;
                 if self.data.len() < n + 1 {
@@ -738,9 +793,9 @@ impl Builder {
     /// Pushes a public key
     pub fn push_key(self, key: &PublicKey) -> Builder {
         if key.compressed {
-            self.push_slice(&key.key.serialize()[..])
+            self.push_slice(&key.inner.serialize()[..])
         } else {
-            self.push_slice(&key.key.serialize_uncompressed()[..])
+            self.push_slice(&key.inner.serialize_uncompressed()[..])
         }
     }
 
@@ -810,7 +865,7 @@ impl<'de> serde::Deserialize<'de> for Script {
         D: serde::Deserializer<'de>,
     {
         use std::fmt::Formatter;
-        use bitcoin::hashes::hex::FromHex;
+        use crate::hex::FromHex;
 
         struct Visitor;
         impl<'de> serde::de::Visitor<'de> for Visitor {
@@ -871,22 +926,22 @@ impl Encodable for Script {
 
 impl Decodable for Script {
     #[inline]
-    fn consensus_decode<D: io::BufRead>(d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<D: io::Read>(d: D) -> Result<Self, encode::Error> {
         Ok(Script(Decodable::consensus_decode(d)?))
     }
 }
 
 #[cfg(test)]
 mod test {
-    use bitcoin::hashes::hex::FromHex;
+    use crate::hex::FromHex;
     use bitcoin::PublicKey;
     use std::str::FromStr;
 
     use super::*;
     use super::build_scriptint;
 
-    use encode::{deserialize, serialize};
-    use opcodes;
+    use crate::encode::{deserialize, serialize};
+    use crate::opcodes;
 
     #[test]
     fn script() {
@@ -1035,18 +1090,18 @@ mod test {
     #[test]
     fn provably_unspendable_test() {
         // p2pk
-        assert_eq!(hex_script!("410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac").is_provably_unspendable(), false);
-        assert_eq!(hex_script!("4104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac").is_provably_unspendable(), false);
+        assert!(!hex_script!("410446ef0102d1ec5240f0d061a4246c1bdef63fc3dbab7733052fbbf0ecd8f41fc26bf049ebb4f9527f374280259e7cfa99c48b0e3f39c51347a19a5819651503a5ac").is_provably_unspendable());
+        assert!(!hex_script!("4104ea1feff861b51fe3f5f8a3b12d0f4712db80e919548a80839fc47c6a21e66d957e9c5d8cd108c7a2d2324bad71f9904ac0ae7336507d785b17a2c115e427a32fac").is_provably_unspendable());
         // p2pkhash
-        assert_eq!(hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_provably_unspendable(), false);
-        assert_eq!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_provably_unspendable(), true);
+        assert!(!hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_provably_unspendable());
+        assert!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_provably_unspendable());
     }
 
     #[test]
     fn op_return_test() {
-        assert_eq!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_op_return(), true);
-        assert_eq!(hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_op_return(), false);
-        assert_eq!(hex_script!("").is_op_return(), false);
+        assert!(hex_script!("6aa9149eb21980dc9d413d8eac27314938b9da920ee53e87").is_op_return());
+        assert!(!hex_script!("76a914ee61d57ab51b9d212335b1dba62794ac20d2bcf988ac").is_op_return());
+        assert!(!hex_script!("").is_op_return());
     }
 
     #[test]

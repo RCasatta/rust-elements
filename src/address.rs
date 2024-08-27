@@ -15,22 +15,28 @@
 //! # Addresses
 //!
 
+use std::convert::TryFrom as _;
 use std::error;
 use std::fmt;
+use std::fmt::Write as _;
 use std::str::FromStr;
 
-use bitcoin::bech32::{self, u5, FromBase32, ToBase32};
-use bitcoin::util::base58;
+use bech32::{Bech32, Bech32m, ByteIterExt, Fe32, Fe32IterExt, Hrp};
+use crate::blech32::{Blech32, Blech32m};
+use crate::hashes::Hash;
+use bitcoin::base58;
 use bitcoin::PublicKey;
-use bitcoin::hashes::Hash;
 use secp256k1_zkp;
+use secp256k1_zkp::Secp256k1;
+use secp256k1_zkp::Verification;
 #[cfg(feature = "serde")]
 use serde;
 
-use blech32;
+use crate::schnorr::{TapTweak, TweakedPublicKey, UntweakedPublicKey};
+use crate::taproot::TapNodeHash;
 
-use {PubkeyHash, ScriptHash, WPubkeyHash, WScriptHash};
-use {opcodes, script};
+use crate::{opcodes, script};
+use crate::{PubkeyHash, ScriptHash, WPubkeyHash, WScriptHash};
 
 /// Encoding error
 #[derive(Debug, PartialEq)]
@@ -38,21 +44,42 @@ pub enum AddressError {
     /// Base58 encoding error
     Base58(base58::Error),
     /// Bech32 encoding error
-    Bech32(bech32::Error),
+    Bech32(bech32::primitives::decode::SegwitHrpstringError),
     /// Blech32 encoding error
-    Blech32(bech32::Error),
+    Blech32(crate::blech32::decode::SegwitHrpstringError),
     /// Was unable to parse the address.
     InvalidAddress(String),
     /// Script version must be 0 to 16 inclusive
-    InvalidWitnessVersion,
-    /// Unsupported witness version
-    UnsupportedWitnessVersion(u8),
+    InvalidWitnessVersion(u8),
+    /// The witness program must be between 2 and 40 bytes in length.
+    InvalidWitnessProgramLength(usize),
+    /// A v0 witness program must be either of length 20 or 32.
+    InvalidSegwitV0ProgramLength(usize),
+    /// A v1+ witness program must use b(l)ech32m not b(l)ech32
+    InvalidWitnessEncoding,
+    /// A v0 witness program must use b(l)ech32 not b(l)ech32m
+    InvalidSegwitV0Encoding,
+
     /// An invalid blinding pubkey was encountered.
     InvalidBlindingPubKey(secp256k1_zkp::UpstreamError),
-    /// Given the program version, the length is invalid
-    ///
-    /// Version 0 scripts must be either 20 or 32 bytes
-    InvalidWitnessProgramLength,
+
+    /// The length (in bytes) of the object was not correct.
+    InvalidLength(usize),
+
+    /// Address version byte were not recognized.
+    InvalidAddressVersion(u8),
+}
+
+impl From<bech32::primitives::decode::SegwitHrpstringError> for AddressError {
+    fn from(e: bech32::primitives::decode::SegwitHrpstringError) -> Self {
+        AddressError::Bech32(e)
+    }
+}
+
+impl From<crate::blech32::decode::SegwitHrpstringError> for AddressError {
+    fn from(e: crate::blech32::decode::SegwitHrpstringError) -> Self {
+        AddressError::Blech32(e)
+    }
 }
 
 impl fmt::Display for AddressError {
@@ -64,16 +91,38 @@ impl fmt::Display for AddressError {
             AddressError::InvalidAddress(ref a) => {
                 write!(f, "was unable to parse the address: {}", a)
             }
-            AddressError::UnsupportedWitnessVersion(ref wver) => {
-                write!(f, "unsupported witness version: {}", wver)
+            AddressError::InvalidWitnessVersion(ref wver) => {
+                write!(f, "invalid witness script version: {}", wver)
+            }
+            AddressError::InvalidWitnessProgramLength(ref len) => {
+                write!(
+                    f,
+                    "the witness program must be between 2 and 40 bytes in length, not {}",
+                    len
+                )
+            }
+            AddressError::InvalidSegwitV0ProgramLength(ref len) => {
+                write!(
+                    f,
+                    "a v0 witness program must be length 20 or 32, not {}",
+                    len
+                )
             }
             AddressError::InvalidBlindingPubKey(ref e) => {
                 write!(f, "an invalid blinding pubkey was encountered: {}", e)
             }
-            AddressError::InvalidWitnessProgramLength => {
-                write!(f, "program length incompatible with version")
+            AddressError::InvalidWitnessEncoding => {
+                write!(f, "v1+ witness program must use b(l)ech32m not b(l)ech32")
             }
-            AddressError::InvalidWitnessVersion => write!(f, "invalid witness script version"),
+            AddressError::InvalidSegwitV0Encoding => {
+                write!(f, "v0 witness program must use b(l)ech32 not b(l)ech32m")
+            }
+            AddressError::InvalidLength(len) => {
+                write!(f, "Address data has invalid length {}", len)
+            }
+            AddressError::InvalidAddressVersion(v) => {
+                write!(f, "address version {} is invalid for this type", v)
+            }
         }
     }
 }
@@ -107,9 +156,9 @@ pub struct AddressParams {
     /// The base58 prefix for blinded addresses.
     pub blinded_prefix: u8,
     /// The bech32 HRP for unblinded segwit addresses.
-    pub bech_hrp: &'static str,
+    pub bech_hrp: Hrp,
     /// The bech32 HRP for blinded segwit addresses.
-    pub blech_hrp: &'static str,
+    pub blech_hrp: Hrp,
 }
 
 impl AddressParams {
@@ -118,8 +167,8 @@ impl AddressParams {
         p2pkh_prefix: 57,
         p2sh_prefix: 39,
         blinded_prefix: 12,
-        bech_hrp: "ex",
-        blech_hrp: "lq",
+        bech_hrp: Hrp::parse_unchecked("ex"),
+        blech_hrp: Hrp::parse_unchecked("lq"),
     };
 
     /// The default Elements network address parameters.
@@ -127,13 +176,22 @@ impl AddressParams {
         p2pkh_prefix: 235,
         p2sh_prefix: 75,
         blinded_prefix: 4,
-        bech_hrp: "ert",
-        blech_hrp: "el",
+        bech_hrp: Hrp::parse_unchecked("ert"),
+        blech_hrp: Hrp::parse_unchecked("el"),
+    };
+
+    /// The default liquid testnet network address parameters.
+    pub const LIQUID_TESTNET: AddressParams = AddressParams {
+        p2pkh_prefix: 36,
+        p2sh_prefix: 19,
+        blinded_prefix: 23,
+        bech_hrp: Hrp::parse_unchecked("tex"),
+        blech_hrp: Hrp::parse_unchecked("tlq"),
     };
 }
 
 /// The method used to produce an address
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Payload {
     /// pay-to-pkhash address
     PubkeyHash(PubkeyHash),
@@ -142,14 +200,14 @@ pub enum Payload {
     /// Segwit address
     WitnessProgram {
         /// The segwit version.
-        version: u5,
+        version: Fe32,
         /// The segwit program.
         program: Vec<u8>,
     },
 }
 
 /// An Elements address.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Address {
     /// the network
     pub params: &'static AddressParams,
@@ -174,7 +232,8 @@ impl Address {
         params: &'static AddressParams,
     ) -> Address {
         let mut hash_engine = PubkeyHash::engine();
-        pk.write_into(&mut hash_engine).expect("engines don't error");
+        pk.write_into(&mut hash_engine)
+            .expect("engines don't error");
 
         Address {
             params,
@@ -206,12 +265,13 @@ impl Address {
         params: &'static AddressParams,
     ) -> Address {
         let mut hash_engine = WPubkeyHash::engine();
-        pk.write_into(&mut hash_engine).expect("engines don't error");
+        pk.write_into(&mut hash_engine)
+            .expect("engines don't error");
 
         Address {
             params,
             payload: Payload::WitnessProgram {
-                version: u5::try_from_u8(0).expect("0<32"),
+                version: Fe32::Q,
                 program: WPubkeyHash::from_engine(hash_engine)[..].to_vec(),
             },
             blinding_pubkey: blinder,
@@ -226,7 +286,8 @@ impl Address {
         params: &'static AddressParams,
     ) -> Address {
         let mut hash_engine = ScriptHash::engine();
-        pk.write_into(&mut hash_engine).expect("engines don't error");
+        pk.write_into(&mut hash_engine)
+            .expect("engines don't error");
 
         let builder = script::Builder::new()
             .push_int(0)
@@ -248,7 +309,7 @@ impl Address {
         Address {
             params,
             payload: Payload::WitnessProgram {
-                version: u5::try_from_u8(0).expect("0<32"),
+                version: Fe32::Q,
                 program: WScriptHash::hash(&script[..])[..].to_vec(),
             },
             blinding_pubkey: blinder,
@@ -274,6 +335,45 @@ impl Address {
         }
     }
 
+    /// Creates a pay to taproot address from an untweaked key.
+    pub fn p2tr<C: Verification>(
+        secp: &Secp256k1<C>,
+        internal_key: UntweakedPublicKey,
+        merkle_root: Option<TapNodeHash>,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
+        Address {
+            params,
+            payload: {
+                let (output_key, _parity) = internal_key.tap_tweak(secp, merkle_root);
+                Payload::WitnessProgram {
+                    version: Fe32::P,
+                    program: output_key.into_inner().serialize().to_vec(),
+                }
+            },
+            blinding_pubkey: blinder,
+        }
+    }
+
+    /// Creates a pay to taproot address from a pre-tweaked output key.
+    ///
+    /// This method is not recommended for use, [`Address::p2tr()`] should be used where possible.
+    pub fn p2tr_tweaked(
+        output_key: TweakedPublicKey,
+        blinder: Option<secp256k1_zkp::PublicKey>,
+        params: &'static AddressParams,
+    ) -> Address {
+        Address {
+            params,
+            payload: Payload::WitnessProgram {
+                version: Fe32::P,
+                program: output_key.into_inner().serialize().to_vec(),
+            },
+            blinding_pubkey: blinder,
+        }
+    }
+
     /// Get an [Address] from an output script.
     pub fn from_script(
         script: &script::Script,
@@ -287,13 +387,18 @@ impl Address {
                 Payload::ScriptHash(Hash::from_slice(&script.as_bytes()[2..22]).unwrap())
             } else if script.is_v0_p2wpkh() {
                 Payload::WitnessProgram {
-                    version: u5::try_from_u8(0).expect("0<32"),
+                    version: Fe32::Q,
                     program: script.as_bytes()[2..22].to_vec(),
                 }
             } else if script.is_v0_p2wsh() {
                 Payload::WitnessProgram {
-                    version: u5::try_from_u8(0).expect("0<32"),
+                    version: Fe32::Q,
                     program: script.as_bytes()[2..34].to_vec(),
+                }
+            } else if script.is_v1plus_p2witprog() {
+                Payload::WitnessProgram {
+                    version: Fe32::try_from(script.as_bytes()[0] - 0x50).expect("0<32"),
+                    program: script.as_bytes()[2..].to_vec(),
                 }
             } else {
                 return None;
@@ -319,7 +424,9 @@ impl Address {
             Payload::WitnessProgram {
                 version: witver,
                 program: ref witprog,
-            } => script::Builder::new().push_int(witver.to_u8() as i64).push_slice(&witprog),
+            } => script::Builder::new()
+                .push_int(witver.to_u8() as i64)
+                .push_slice(witprog),
         }
         .into_script()
     }
@@ -347,42 +454,13 @@ impl Address {
         blinded: bool,
         params: &'static AddressParams,
     ) -> Result<Address, AddressError> {
-        let payload = if !blinded {
-            bech32::decode(s).map_err(AddressError::Bech32)?.1
+        let (version, data): (Fe32, Vec<u8>) = if blinded {
+            let hs = crate::blech32::decode::SegwitHrpstring::new(s)?;
+            (hs.witness_version(), hs.byte_iter().collect())
         } else {
-            blech32::decode(s).map_err(AddressError::Blech32)?.1
+            let hs = bech32::primitives::decode::SegwitHrpstring::new(s)?;
+            (hs.witness_version(), hs.byte_iter().collect())
         };
-
-        if payload.is_empty() {
-            return Err(AddressError::InvalidAddress(s.to_owned()));
-        }
-
-        // Get the script version and program (converted from 5-bit to 8-bit)
-        let (version, data) = {
-            let (v, p5) = payload.split_at(1);
-            let data_res = Vec::from_base32(p5);
-            if let Err(e) = data_res {
-                return Err(match blinded {
-                    true => AddressError::Blech32(e),
-                    false => AddressError::Bech32(e),
-                });
-            }
-            (v[0], data_res.unwrap())
-        };
-        if version.to_u8() > 16 {
-            return Err(AddressError::InvalidWitnessVersion);
-        }
-
-        // Segwit version specific checks.
-        if version.to_u8() != 0 {
-            return Err(AddressError::UnsupportedWitnessVersion(version.to_u8()));
-        }
-        if !blinded && version.to_u8() == 0 && data.len() != 20 && data.len() != 32 {
-            return Err(AddressError::InvalidWitnessProgramLength);
-        }
-        if blinded && version.to_u8() == 0 && data.len() != 53 && data.len() != 65 {
-            return Err(AddressError::InvalidWitnessProgramLength);
-        }
 
         let (blinding_pubkey, program) = match blinded {
             true => (
@@ -397,10 +475,7 @@ impl Address {
 
         Ok(Address {
             params,
-            payload: Payload::WitnessProgram {
-                version,
-                program,
-            },
+            payload: Payload::WitnessProgram { version, program },
             blinding_pubkey,
         })
     }
@@ -415,13 +490,13 @@ impl Address {
         let (blinded, prefix) = match data[0] == params.blinded_prefix {
             true => {
                 if data.len() != 55 {
-                    return Err(base58::Error::InvalidLength(data.len()).into());
+                    return Err(AddressError::InvalidLength(data.len()));
                 }
                 (true, data[1])
             }
             false => {
                 if data.len() != 21 {
-                    return Err(base58::Error::InvalidLength(data.len()).into());
+                    return Err(AddressError::InvalidLength(data.len()));
                 }
                 (false, data[0])
             }
@@ -443,7 +518,7 @@ impl Address {
         } else if prefix == params.p2sh_prefix {
             Payload::ScriptHash(ScriptHash::from_slice(payload_data).unwrap())
         } else {
-            return Err(base58::Error::InvalidAddressVersion(prefix).into());
+            return Err(AddressError::InvalidAddressVersion(prefix));
         };
 
         Ok(Address {
@@ -469,9 +544,9 @@ impl Address {
 
         // Base58.
         if s.len() > 150 {
-            return Err(base58::Error::InvalidLength(s.len() * 11 / 15).into());
+            return Err(AddressError::InvalidLength(s.len() * 11 / 15));
         }
-        let data = base58::from_check(s)?;
+        let data = base58::decode_check(s)?;
         Address::from_base58(&data, params)
     }
 }
@@ -486,12 +561,12 @@ impl fmt::Display for Address {
                     prefixed[1] = self.params.p2pkh_prefix;
                     prefixed[2..35].copy_from_slice(&blinder.serialize());
                     prefixed[35..].copy_from_slice(&hash[..]);
-                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                    base58::encode_check_to_fmt(fmt, &prefixed[..])
                 } else {
                     let mut prefixed = [0; 21];
                     prefixed[0] = self.params.p2pkh_prefix;
                     prefixed[1..].copy_from_slice(&hash[..]);
-                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                    base58::encode_check_to_fmt(fmt, &prefixed[..])
                 }
             }
             Payload::ScriptHash(ref hash) => {
@@ -501,12 +576,12 @@ impl fmt::Display for Address {
                     prefixed[1] = self.params.p2sh_prefix;
                     prefixed[2..35].copy_from_slice(&blinder.serialize());
                     prefixed[35..].copy_from_slice(&hash[..]);
-                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                    base58::encode_check_to_fmt(fmt, &prefixed[..])
                 } else {
                     let mut prefixed = [0; 21];
                     prefixed[0] = self.params.p2sh_prefix;
                     prefixed[1..].copy_from_slice(&hash[..]);
-                    base58::check_encode_slice_to_fmt(fmt, &prefixed[..])
+                    base58::encode_check_to_fmt(fmt, &prefixed[..])
                 }
             }
             Payload::WitnessProgram {
@@ -518,20 +593,53 @@ impl fmt::Display for Address {
                     false => self.params.bech_hrp,
                 };
 
+                // FIXME: surely we can fix this logic to not be so repetitive.
                 if self.is_blinded() {
-                    let mut data = Vec::with_capacity(53);
                     if let Some(ref blinder) = self.blinding_pubkey {
-                        data.extend_from_slice(&blinder.serialize());
+                        let byte_iter = IntoIterator::into_iter(blinder.serialize())
+                            .chain(witprog.iter().copied());
+                        let fe_iter = byte_iter.bytes_to_fes();
+                        if witver.to_u8() == 0 {
+                            for c in fe_iter
+                                .with_checksum::<Blech32>(&hrp)
+                                .with_witness_version(witver)
+                                .chars()
+                            {
+                                fmt.write_char(c)?;
+                            }
+                        } else {
+                            for c in fe_iter
+                                .with_checksum::<Blech32m>(&hrp)
+                                .with_witness_version(witver)
+                                .chars()
+                            {
+                                fmt.write_char(c)?;
+                            }
+                        }
+                        return Ok(());
                     }
-                    data.extend_from_slice(&witprog);
-                    let mut b32_data = vec![witver];
-                    b32_data.extend_from_slice(&data.to_base32());
-                    blech32::encode_to_fmt(fmt, &hrp, &b32_data)
-                } else {
-                    let mut bech32_writer = bech32::Bech32Writer::new(hrp, bech32::Variant::Bech32, fmt)?;
-                    bech32::WriteBase32::write_u5(&mut bech32_writer, witver)?;
-                    bech32::ToBase32::write_base32(&witprog, &mut bech32_writer)
                 }
+
+                let byte_iter = witprog.iter().copied();
+                let fe_iter = byte_iter.bytes_to_fes();
+                if witver.to_u8() == 0 {
+                    for c in fe_iter
+                        .with_checksum::<Bech32>(&hrp)
+                        .with_witness_version(witver)
+                        .chars()
+                    {
+                        fmt.write_char(c)?;
+                    }
+                } else {
+                    for c in fe_iter
+                        .with_checksum::<Bech32m>(&hrp)
+                        .with_witness_version(witver)
+                        .chars()
+                    {
+                        fmt.write_char(c)?;
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -556,12 +664,12 @@ fn find_prefix(bech32: &str) -> &str {
 /// Checks if both prefixes match, regardless of case.
 /// The first prefix can be mixed case, but the second one is expected in
 /// lower case.
-fn match_prefix(prefix_mixed: &str, prefix_lower: &str) -> bool {
-    if prefix_lower.len() != prefix_mixed.len() {
+fn match_prefix(prefix_mixed: &str, target: Hrp) -> bool {
+    if target.len() != prefix_mixed.len() {
         false
     } else {
-        prefix_lower
-            .chars()
+        target
+            .lowercase_char_iter()
             .zip(prefix_mixed.chars())
             .all(|(char_lower, char_mixed)| char_lower == char_mixed.to_ascii_lowercase())
     }
@@ -574,37 +682,35 @@ impl FromStr for Address {
         // shorthands
         let liq = &AddressParams::LIQUID;
         let ele = &AddressParams::ELEMENTS;
+        let liq_test = &AddressParams::LIQUID_TESTNET;
 
-        // Bech32.
+        let net_arr = [liq, ele, liq_test];
+
         let prefix = find_prefix(s);
-        if match_prefix(prefix, liq.bech_hrp) {
-            return Address::from_bech32(s, false, liq);
-        }
-        if match_prefix(prefix, liq.blech_hrp) {
-            return Address::from_bech32(s, true, liq);
-        }
-        if match_prefix(prefix, ele.bech_hrp) {
-            return Address::from_bech32(s, false, ele);
-        }
-        if match_prefix(prefix, ele.blech_hrp) {
-            return Address::from_bech32(s, true, ele);
+        for net in net_arr.iter() {
+            // Bech32.
+            if match_prefix(prefix, net.bech_hrp) {
+                return Address::from_bech32(s, false, net);
+            }
+            if match_prefix(prefix, net.blech_hrp) {
+                return Address::from_bech32(s, true, net);
+            }
         }
 
         // Base58.
         if s.len() > 150 {
-            return Err(base58::Error::InvalidLength(s.len() * 11 / 15).into());
+            return Err(AddressError::InvalidLength(s.len() * 11 / 15));
         }
-        let data = base58::from_check(s)?;
+        let data = base58::decode_check(s)?;
         if data.is_empty() {
-            return Err(base58::Error::InvalidLength(data.len()).into());
+            return Err(AddressError::InvalidLength(data.len()));
         }
 
         let p = data[0];
-        if p == liq.p2pkh_prefix || p == liq.p2sh_prefix || p == liq.blinded_prefix {
-            return Address::from_base58(&data, liq);
-        }
-        if p == ele.p2pkh_prefix || p == ele.p2sh_prefix || p == ele.blinded_prefix {
-            return Address::from_base58(&data, ele);
+        for net in net_arr.iter() {
+            if p == net.p2pkh_prefix || p == net.p2sh_prefix || p == net.blinded_prefix {
+                return Address::from_base58(&data, net);
+            }
         }
 
         Err(AddressError::InvalidAddress(s.to_owned()))
@@ -667,9 +773,9 @@ impl serde::Serialize for Address {
 #[cfg(test)]
 mod test {
     use super::*;
-    use bitcoin::util::key;
+    use crate::Script;
+    use bitcoin::key;
     use secp256k1_zkp::{PublicKey, Secp256k1};
-    use Script;
     #[cfg(feature = "serde")]
     use serde_json;
 
@@ -688,9 +794,18 @@ mod test {
         );
         #[cfg(feature = "serde")]
         assert_eq!(
-            serde_json::from_value::<Address>(serde_json::to_value(&addr).unwrap()).ok().as_ref(),
+            serde_json::from_value::<Address>(serde_json::to_value(addr).unwrap())
+                .ok()
+                .as_ref(),
             Some(addr)
         );
+    }
+
+    #[test]
+    fn regression_188() {
+        // Tests that the `tlq` prefix was not accidentally changed, e.g. to `tlg` :).
+        let addr = Address::from_str("tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn").unwrap();
+        roundtrips(&addr);
     }
 
     #[test]
@@ -757,12 +872,143 @@ mod test {
 
         for &(a, blinded, ref params) in &addresses {
             let result = a.parse();
-            assert!(result.is_ok(), "vector: {}, err: \"{}\"", a, result.unwrap_err());
+            assert!(
+                result.is_ok(),
+                "vector: {}, err: \"{}\"",
+                a,
+                result.unwrap_err()
+            );
             let addr: Address = result.unwrap();
             assert_eq!(a, &addr.to_string(), "vector: {}", a);
             assert_eq!(blinded, addr.is_blinded());
             assert_eq!(params, addr.params);
             roundtrips(&addr);
+        }
+    }
+
+    #[test]
+    fn test_blech32_vectors() {
+        // taken from Elements test/functional/rpc_invalid_address_message.py
+        let address: Result<Address, _> = "el1qq0umk3pez693jrrlxz9ndlkuwne93gdu9g83mhhzuyf46e3mdzfpva0w48gqgzgrklncnm0k5zeyw8my2ypfsmxh4xcjh2rse".parse();
+        assert!(address.is_ok());
+
+        let address: Result<Address, _> = "el1pq0umk3pez693jrrlxz9ndlkuwne93gdu9g83mhhzuyf46e3mdzfpva0w48gqgzgrklncnm0k5zeyw8my2ypfsxguu9nrdg2pc".parse();
+        assert_eq!(
+            address.err().unwrap().to_string(),
+            "blech32 error: invalid checksum", // is valid blech32, but should be blech32m
+        );
+
+        let address: Result<Address, _> = "el1qq0umk3pez693jrrlxz9ndlkuwne93gdu9g83mhhzuyf46e3mdzfpva0w48gqgzgrklncnm0k5zeyw8my2ypfsnnmzrstzt7de".parse();
+        assert_eq!(
+            address.err().unwrap().to_string(),
+            "blech32 error: invalid checksum", // is valid blech32m, but should be blech32
+        );
+
+        let address: Result<Address, _> =
+            "ert130xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqqu2tys".parse();
+        assert_eq!(
+            address.err().unwrap().to_string(),
+            "bech32 error: invalid segwit witness version: 17 (bech32 character: '3')",
+        );
+
+        let address: Result<Address, _> = "el1pq0umk3pez693jrrlxz9ndlkuwne93gdu9g83mhhzuyf46e3mdzfpva0w48gqgzgrklncnm0k5zeyw8my2ypfsqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpe9jfn0gypaj".parse();
+        assert_eq!(
+            address.err().unwrap().to_string(),
+            "blech32 error: invalid witness length",
+        );
+
+        // "invalid prefix" gives a weird error message because we do
+        // a dumb prefix check before even attempting bech32 decoding
+        let address: Result<Address, _> = "rrr1qq0umk3pez693jrrlxz9ndlkuwne93gdu9g83mhhzuyf46e3mdzfpva0w48gqgzgrklncnm0k5zeyw8my2ypfs2d9rp7meq4kg".parse();
+        assert_eq!(address.err().unwrap().to_string(), "base58 error: decode",);
+    }
+
+    #[test]
+    fn test_fixed_addresses() {
+        let pk = bitcoin::PublicKey::from_str(
+            "0212bf0ea45b733dfde8ecb5e896306c4165c666c99fc5d1ab887f71393a975cea",
+        )
+        .unwrap();
+        let script = Script::default();
+        let secp = Secp256k1::verification_only();
+        let internal_key = UntweakedPublicKey::from_str(
+            "93c7378d96518a75448821c4f7c8f4bae7ce60f804d03d1f0628dd5dd0f5de51",
+        )
+        .unwrap();
+        let tap_node_hash = TapNodeHash::all_zeros();
+
+        let mut expected = IntoIterator::into_iter([
+            "2dszRCFv8Ub4ytKo1Q1vXXGgSx7mekNDwSJ",
+            "XToMocNywBYNSiXUe5xvoa2naAps9Ek1hq",
+            "ert1qew0l0emv7449u7hqgc8utzdzryhse79yhq2sxv",
+            "XZF6k8S6eoVxXMB4NpWjh2s7LjQUP7pw2R",
+            "ert1quwcvgs5clswpfxhm7nyfjmaeysn6us0yvjdexn9yjkv3k7zjhp2szaqlpq",
+            "ert1p8qs0qcn25l2y6yvtc5t95rr8w9pndcj64c8rkutnvkcvdp6gh02q2cqvj9",
+            "ert1pxrrurkg8j8pve97lffvv2y67cf7ux478h077c87qacqzhue7390sqkjp06",
+            "CTEkC79sYAvWNcxd8iTYnYo226FqRBbzBcMppq7L2dA8jVXJWoo1kKWB3UBLY6gBjiXf87ibs8c6mQyZ",
+            "AzpjUhKMLJi9y2oLt3ZdM3BP9nHdLPJfGMVxRBaRc2gDpeNqPMVpShTszJW7bX42vT2KoejYy8GtbcxH",
+            "el1qqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww4jul7lnkeat2teawq3s0cky6yxf0pnu2gmz9ej9kyq5yc",
+            "AzpjUhKMLJi9y2oLt3ZdM3BP9nHdLPJfGMVxRBaRc2gDpeNvq6SLVpBVwtakF6nmUFundyW7YjUdVkpr",
+            "el1qqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww4casc3pf3lquzjd0haxgn9hmjfp84eq7geymjdx2f9verdu99wz4h79u87cnxdzq",
+            "el1pqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww5wpq7p3x4f75f5gch3gktgxxwu2rxm394tsw8dchxedsc6r53w75cj24fq2u2ls5",
+            "el1pqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww5vx8c8vs0ywzejta7jjcc5f4asnacdtu0wlaas0upmsq90enaz2lhjd0k0q7qn4h",
+            "QFq3vvrr6Ub2KAyb3LdoCxEQvKukB6nN9i",
+            "GydeMhecNgrq17WMkyyTM4ETv1YubMVtLN",
+            "ex1qew0l0emv7449u7hqgc8utzdzryhse79ydjqgek",
+            "H55PJDhj6JpR5k9wViXGEX4nga8WmhXtnD",
+            "ex1quwcvgs5clswpfxhm7nyfjmaeysn6us0yvjdexn9yjkv3k7zjhp2s4sla8h",
+            "ex1p8qs0qcn25l2y6yvtc5t95rr8w9pndcj64c8rkutnvkcvdp6gh02qa4lw5j",
+            "ex1pxrrurkg8j8pve97lffvv2y67cf7ux478h077c87qacqzhue7390shmdrfd",
+            "VTptY6cqJbusNpL5xvo8VL38nLX9PGDjfYQfqhu9EaA7FtuidkWyQzMHY9jzZrpBcCXT437vM6V4N8kh",
+            "VJL64Ep3rcngP4cScRme15q9i8MCNiuqWeiG3YbtduUidVyorg7nRsgmmF714QtH3sNpWB2CqsVVciQh",
+            "lq1qqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww4jul7lnkeat2teawq3s0cky6yxf0pnu2gs2923tg58xcz",
+            "VJL64Ep3rcngP4cScRme15q9i8MCNiuqWeiG3YbtduUidVyuJR4JUzQPiqBdhzd1bgGHLVnmRUjfHc68",
+            "lq1qqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww4casc3pf3lquzjd0haxgn9hmjfp84eq7geymjdx2f9verdu99wz47jmkmgmr9a4s",
+            "lq1pqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww5wpq7p3x4f75f5gch3gktgxxwu2rxm394tsw8dchxedsc6r53w75375l4kfvf08y",
+            "lq1pqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww5vx8c8vs0ywzejta7jjcc5f4asnacdtu0wlaas0upmsq90enaz2l77n92erwrrz8",
+            "FojPFeboBgrd953mXXe72KWthjVwHWozqN",
+            "8vsafXgrB5bJeSidGbK5eYnjKvQ3RiB4BB",
+            "tex1qew0l0emv7449u7hqgc8utzdzryhse79yh5jp9a",
+            "92KKc3jxthYtj5ND1KrtY1d46UyeWV6XbP",
+            "tex1quwcvgs5clswpfxhm7nyfjmaeysn6us0yvjdexn9yjkv3k7zjhp2s5fd6kc",
+            "tex1p8qs0qcn25l2y6yvtc5t95rr8w9pndcj64c8rkutnvkcvdp6gh02quvdf9a",
+            "tex1pxrrurkg8j8pve97lffvv2y67cf7ux478h077c87qacqzhue7390skzlycz",
+            "vtS71VhcpFt978sha5d1L2gCzp3UL5kXacRpb3N4GTW5MwvBzz5HwxYyB8Pns4yM2dd2osmQkHSkp88u",
+            "vjTuLJ76nGi8PUopBVmGK8bLKPfBpaBWf6wKfn8z9Vdz6ubVhpvmMr6TK2RcqAYiujN1g1uwg8kejrM3",
+            "tlq1qqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww4jul7lnkeat2teawq3s0cky6yxf0pnu2gq8g2kuxfj8ft",
+            "vjTuLJ76nGi8PUopBVmGK8bLKPfBpaBWf6wKfn8z9Vdz6ubb9ZsHQxp5GcWFUkHTTYFUWLgWFk1DN5Fe",
+            "tlq1qqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww4casc3pf3lquzjd0haxgn9hmjfp84eq7geymjdx2f9verdu99wz4e6vcdfcyp5m8",
+            "tlq1pqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww5wpq7p3x4f75f5gch3gktgxxwu2rxm394tsw8dchxedsc6r53w75kkr3rh2tdxfn",
+            "tlq1pqgft7r4ytdenml0gaj67393sd3qkt3nxex0ut5dt3plhzwf6jaww5vx8c8vs0ywzejta7jjcc5f4asnacdtu0wlaas0upmsq90enaz2lekytucqf82vs",
+        ]);
+
+        for params in [
+            &AddressParams::ELEMENTS,
+            &AddressParams::LIQUID,
+            &AddressParams::LIQUID_TESTNET,
+        ] {
+            for blinder in [None, Some(pk.inner)] {
+                let addr = Address::p2pkh(&pk, blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+
+                let addr = Address::p2sh(&script, blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+
+                let addr = Address::p2wpkh(&pk, blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+
+                let addr = Address::p2shwpkh(&pk, blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+
+                let addr = Address::p2wsh(&script, blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+
+                let addr = Address::p2tr(&secp, internal_key, None, blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+
+                let addr = Address::p2tr(&secp, internal_key, Some(tap_node_hash), blinder, params);
+                assert_eq!(&addr.to_string(), expected.next().unwrap());
+            }
         }
     }
 }

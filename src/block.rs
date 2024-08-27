@@ -17,14 +17,14 @@
 
 use std::io;
 
-use bitcoin::hashes::{Hash, sha256};
 #[cfg(feature = "serde")] use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "serde")] use std::fmt;
 
-use dynafed;
-use Transaction;
-use encode::{self, Encodable, Decodable, serialize};
-use {BlockHash, Script, TxMerkleNode, VarInt};
+use crate::dynafed;
+use crate::hashes::{Hash, sha256};
+use crate::Transaction;
+use crate::encode::{self, serialize, Decodable, Encodable, VarInt};
+use crate::{BlockHash, Script, TxMerkleNode};
 
 /// Data related to block signatures
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -202,7 +202,7 @@ impl Default for ExtData {
 }
 
 /// Elements block header
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BlockHeader {
     /// Version - should be 0x20000000 except when versionbits signalling
     pub version: u32,
@@ -250,14 +250,7 @@ impl BlockHeader {
 
     /// Returns true if this is a block with dynamic federations enabled.
     pub fn is_dynafed(&self) -> bool {
-        if let ExtData::Dynafed {
-            ..
-        } = self.ext
-        {
-            true
-        } else {
-            false
-        }
+        matches!(self.ext, ExtData::Dynafed { .. })
     }
 
     /// Remove the witness data of the block header.
@@ -280,10 +273,10 @@ impl BlockHeader {
             ExtData::Proof { .. } => None,
             ExtData::Dynafed { ref current, ref proposed, .. } => {
                 let leaves = [
-                    current.calculate_root().into_inner(),
-                    proposed.calculate_root().into_inner(),
+                    current.calculate_root().to_byte_array(),
+                    proposed.calculate_root().to_byte_array(),
                 ];
-                Some(::fast_merkle_root::fast_merkle_root(&leaves[..]))
+                Some(crate::fast_merkle_root::fast_merkle_root(&leaves[..]))
             }
         }
     }
@@ -323,7 +316,7 @@ impl Encodable for BlockHeader {
 }
 
 impl Decodable for BlockHeader {
-    fn consensus_decode<D: io::BufRead>(mut d: D) -> Result<Self, encode::Error> {
+    fn consensus_decode<D: io::Read>(mut d: D) -> Result<Self, encode::Error> {
         let mut version: u32 = Decodable::consensus_decode(&mut d)?;
         let is_dyna = if version >> 31 == 1 {
             version &= 0x7fff_ffff;
@@ -355,7 +348,7 @@ impl Decodable for BlockHeader {
 }
 
 /// Elements block
-#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct Block {
     /// Header of the block
     pub header: BlockHeader,
@@ -372,32 +365,42 @@ impl Block {
     }
 
     /// Get the size of the block
+    #[deprecated(since = "0.19.1", note = "Please use `Block::size` instead.")]
     pub fn get_size(&self) -> usize {
+        self.size()
+    }
+
+    /// Get the size of the block
+    pub fn size(&self) -> usize {
         // The size of the header + the size of the varint with the tx count + the txs themselves
-        let base_size = serialize(&self.header).len() + VarInt(self.txdata.len() as u64).len();
-        let txs_size: usize = self.txdata.iter().map(Transaction::get_size).sum();
+        let base_size = serialize(&self.header).len() + VarInt(self.txdata.len() as u64).size();
+        let txs_size: usize = self.txdata.iter().map(Transaction::size).sum();
         base_size + txs_size
     }
 
     /// Get the weight of the block
+    #[deprecated(since = "0.19.1", note = "Please use `Block::weight` instead.")]
     pub fn get_weight(&self) -> usize {
-        let base_weight = 4 * (serialize(&self.header).len() + VarInt(self.txdata.len() as u64).len());
-        let txs_weight: usize = self.txdata.iter().map(Transaction::get_weight).sum();
+        self.weight()
+    }
+
+    /// Get the weight of the block
+    pub fn weight(&self) -> usize {
+        let base_weight = 4 * (serialize(&self.header).len() + VarInt(self.txdata.len() as u64).size());
+        let txs_weight: usize = self.txdata.iter().map(Transaction::weight).sum();
         base_weight + txs_weight
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use Block;
+    use crate::Block;
+    use crate::hex::FromHex;
 
     use super::*;
 
-    #[test]
-    fn block() {
-        // Simple block with only coinbase output
-        let block: Block = hex_deserialize!(
-            "00000020a66e4a4baff69735267346d12e59e8a0da848b593813554deb16a6f3\
+    const SIMPLE_BLOCK: &str = "\
+             00000020a66e4a4baff69735267346d12e59e8a0da848b593813554deb16a6f3\
              6cd035e9aab0e2451724598471dd4e45f0dca40ca5f4ac62e61957e50925af08\
              59891fcc8842805b020000000151000102000000010100000000000000000000\
              00000000000000000000000000000000000000000000ffffffff03520101ffff\
@@ -406,8 +409,55 @@ mod tests {
              459e1b69e8e60fcee2e4940c7a0d5de1b201000000000000000000266a24aa21\
              a9ed94f15ed3a62165e4a0b99699cc28b48e19cb5bc1b1f47155db62d63f1e04\
              7d45000000000000012000000000000000000000000000000000000000000000\
-             000000000000000000000000000000"
-        );
+             000000000000000000000000000000\
+             ";
+    const DYNAFED_BLOCK: &str = "\
+            000000a0da9d569617d1d65c3390a01c18c4fa7c4d0f4738b6fc2b5c5faf2e8a\
+            463abbaa46eb9123808e1e2ff75e9472fa0f0589b53b7518a69d3d6fcb9228ed\
+            345734ea06b9c45d070000000122002057c555a91edf9552282d88624d1473c2\
+            75e64b7218870eb8fb0335b442976b8d02010000fbee9cea00d8efdc49cfbec3\
+            28537e0d7032194de6ebf3cf42e5c05bb89a08b100040047304402206f55bc87\
+            1387a9840489d47624b02995e774e3b70fed56d1eb43a9a53d4fd3e102201e1c\
+            bfbbd1079f5bea3bc216882d3fefbf6f27aa761820d3a88f12e5a5ea7ff00148\
+            3045022100c072816f6561e73ee6c0ae32d55c3eec4da73b035425e4eb05ab50\
+            772591b4360220311bf295010094a489d9b280d9dafb724d776a1d99b9ede31c\
+            4b59bc2095c5c30169522103cadff18e928133df2e670a3715c4e7a81d357de3\
+            6ddaa5016628e70a3e6a452f21021f0d8638c413ef7769cd711ce84c8f192f5a\
+            85f0fd6d8e63ddb4d2cf6740b23b210296db75c11ea3a292a372f6c94f5013ea\
+            eb379f701857a702f3b83f88da21be6f53ae0102000000010100000000000000\
+            00000000000000000000000000000000000000000000000000ffffffff035701\
+            01ffffffff020137c495f58d698979ff9124e8c7455fe79b13ddb96afa25c458\
+            94eb059868a8c001000000000000000000016a0137c495f58d698979ff9124e8\
+            c7455fe79b13ddb96afa25c45894eb059868a8c001000000000000000000266a\
+            24aa21a9ed94f15ed3a62165e4a0b99699cc28b48e19cb5bc1b1f47155db62d6\
+            3f1e047d45000000000000012000000000000000000000000000000000000000\
+            000000000000000000000000000000000000\
+            ";
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn blockheader_serde() {
+        let block: Block = hex_deserialize!(&SIMPLE_BLOCK);
+        roundtrip_header(&block.header);
+        let block: Block = hex_deserialize!(&DYNAFED_BLOCK);
+        roundtrip_header(&block.header);
+    }
+    #[cfg(feature = "serde")]
+    fn roundtrip_header(header: &BlockHeader) {
+        let header_ser = serde_json::to_string(header).unwrap();
+        let header_deser: BlockHeader = serde_json::from_str(&header_ser).unwrap();
+
+        assert_eq!(&header_deser, header);
+        let header_ser = serde_cbor::to_vec(header).unwrap();
+        let header_deser: BlockHeader = serde_cbor::from_slice(&header_ser).unwrap();
+
+        assert_eq!(&header_deser, header);
+    }
+
+    #[test]
+    fn block() {
+        // Simple block with only coinbase output
+        let block: Block = hex_deserialize!(SIMPLE_BLOCK);
 
         assert_eq!(
             block.block_hash().to_string(),
@@ -416,8 +466,8 @@ mod tests {
         assert_eq!(block.header.version, 0x20000000);
         assert_eq!(block.header.height, 2);
         assert_eq!(block.txdata.len(), 1);
-        assert_eq!(block.get_size(), serialize(&block).len());
-        assert_eq!(block.get_weight(), 1089);
+        assert_eq!(block.size(), serialize(&block).len());
+        assert_eq!(block.weight(), 1089);
 
         // Block with 3 transactions ... the rangeproofs are very large :)
         let block: Block = hex_deserialize!(
@@ -628,7 +678,7 @@ mod tests {
         assert_eq!(block.header.version, 0x20000000);
         assert_eq!(block.header.height, 1);
         assert_eq!(block.txdata.len(), 3);
-        assert_eq!(block.get_size(), serialize(&block).len());
+        assert_eq!(block.size(), serialize(&block).len());
 
         // 2-of-3 signed block from Liquid integration tests
         let block: Block = hex_deserialize!(
@@ -668,28 +718,7 @@ mod tests {
     #[test]
     fn dynafed_block() {
         // Copied from elements RPC during a functionary integration test run
-        let block: Block = hex_deserialize!("\
-            000000a0da9d569617d1d65c3390a01c18c4fa7c4d0f4738b6fc2b5c5faf2e8a\
-            463abbaa46eb9123808e1e2ff75e9472fa0f0589b53b7518a69d3d6fcb9228ed\
-            345734ea06b9c45d070000000122002057c555a91edf9552282d88624d1473c2\
-            75e64b7218870eb8fb0335b442976b8d02010000fbee9cea00d8efdc49cfbec3\
-            28537e0d7032194de6ebf3cf42e5c05bb89a08b100040047304402206f55bc87\
-            1387a9840489d47624b02995e774e3b70fed56d1eb43a9a53d4fd3e102201e1c\
-            bfbbd1079f5bea3bc216882d3fefbf6f27aa761820d3a88f12e5a5ea7ff00148\
-            3045022100c072816f6561e73ee6c0ae32d55c3eec4da73b035425e4eb05ab50\
-            772591b4360220311bf295010094a489d9b280d9dafb724d776a1d99b9ede31c\
-            4b59bc2095c5c30169522103cadff18e928133df2e670a3715c4e7a81d357de3\
-            6ddaa5016628e70a3e6a452f21021f0d8638c413ef7769cd711ce84c8f192f5a\
-            85f0fd6d8e63ddb4d2cf6740b23b210296db75c11ea3a292a372f6c94f5013ea\
-            eb379f701857a702f3b83f88da21be6f53ae0102000000010100000000000000\
-            00000000000000000000000000000000000000000000000000ffffffff035701\
-            01ffffffff020137c495f58d698979ff9124e8c7455fe79b13ddb96afa25c458\
-            94eb059868a8c001000000000000000000016a0137c495f58d698979ff9124e8\
-            c7455fe79b13ddb96afa25c45894eb059868a8c001000000000000000000266a\
-            24aa21a9ed94f15ed3a62165e4a0b99699cc28b48e19cb5bc1b1f47155db62d6\
-            3f1e047d45000000000000012000000000000000000000000000000000000000\
-            000000000000000000000000000000000000\
-        ");
+        let block: Block = hex_deserialize!(DYNAFED_BLOCK);
 
         // Test that this is a block with compact current params and null proposed params
         if let ExtData::Dynafed { current, proposed, .. } = block.clone().header.ext {
@@ -761,5 +790,13 @@ mod tests {
             block.block_hash().to_string(),
             "e9a5176b1690a448f76fb691ab4d516e60e13a6e7a49454c62dbf0d611ffcce7"
         );
+    }
+
+    #[test]
+    fn test_failed_block() {
+        let block_str = include_str!("../tests/data/failedblock.hex");
+
+        let bytes = Vec::<u8>::from_hex(block_str).unwrap();
+        let _block = encode::deserialize::<Block>(&bytes).unwrap();
     }
 }

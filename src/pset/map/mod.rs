@@ -12,8 +12,8 @@
 // If not, see <http://creativecommons.org/publicdomain/zero/1.0/>.
 //
 
-use encode;
-use pset::{self, raw};
+use crate::encode;
+use crate::pset::{self, raw};
 
 /// A trait that describes a PSET key-value map.
 pub(crate) trait Map {
@@ -35,4 +35,6 @@ mod output;
 pub use self::global::Global;
 pub use self::global::TxData as GlobalTxData;
 pub use self::input::Input;
+pub use self::input::PsbtSighashType;
 pub use self::output::Output;
+pub use self::output::TapTree;
